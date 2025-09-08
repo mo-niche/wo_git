@@ -2,20 +2,20 @@ common:
 
   ## DATAFILL TENANT AND SUBSCRIPTION INFO <<<<<--- 
 
-  tenantId: "<TENANT_ID>"
-  subscriptionId: "<SUBSCRIPTION_ID>"
-  rg: "<RESOURCEGROUP>"
-  location: "<LOCATION>"
+  tenantId: "72f988bf-86f1-41af-91ab-2d7cd011db47"
+  subscriptionId: "973d15c6-6c57-447e-b9c6-6d79b5b784ab"
+  rg: "mnath3-rg"
+  location: "eastus2"
 
 context:
 
   ## DATAFILL CONTEXT INFO <<<<<----
 
-  contextRG: "<CONTEXT-RG>"
-  contextName: "<CONTEXT-NAME>"
-  contextLocation: "<CONTEXT-LOCATION>"
-  contextTenantId: "<TENANT_ID of CONTEXT-NAME>"
-  contextSubscriptionId: "<SUBID of CONTEXT-NAME>"
+  contextRG: "Mehoopany"
+  contextName: "Mehoopany-Context"
+  contextLocation: "eastus2euap"
+  contextTenantId: "72f988bf-86f1-41af-91ab-2d7cd011db47"
+  contextSubscriptionId: "973d15c6-6c57-447e-b9c6-6d79b5b784ab"
 
 capabilities:
   - name: "azure-soap"
