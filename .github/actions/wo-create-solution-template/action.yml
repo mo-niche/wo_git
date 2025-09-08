@@ -1,0 +1,439 @@
+name: Create Workload Orchestration Solution Template
+description: Creates an Azure Workload Orchestration Solution Template using provided parameters
+
+outputs:
+  files_created:
+    description: 'Whether solution template metadata files were created'
+    value: ${{ steps.process-templates.outputs.files_created }}
+  templates-skipped:
+    description: 'Number of templates that were skipped (already existed)'
+    value: ${{ steps.process-templates.outputs.templates_skipped }}
+  templates-failed:
+    description: 'Number of templates that failed to create'
+    value: ${{ steps.process-templates.outputs.templates_failed }}
+  skipped-templates-details:
+    description: 'JSON array with details of skipped templates'
+    value: ${{ steps.process-templates.outputs.skipped_templates_details }}
+  failed-templates-details:
+    description: 'JSON array with details of failed templates'
+    value: ${{ steps.process-templates.outputs.failed_templates_details }}
+
+inputs:
+  app-name:
+    description: 'Name of the application (folder name)'
+    required: true
+  azure-credentials:
+    description: 'Azure credentials for authentication'
+    required: false
+  resource-group:
+    description: 'Azure Resource Group name'
+    required: true
+  location:
+    description: 'Azure region location'
+    required: true
+  # Single file inputs (for backward compatibility)
+  solution-template-name:
+    description: 'Name of the solution template (if not provided, read from template file)'
+    required: false
+  solution-template-version:
+    description: 'Version of the solution template (if not provided, read from template file)'
+    required: false
+  capabilities:
+    description: 'Capabilities for the solution template as JSON array (e.g. ["cap1","cap2"]). If not provided, read from metadata'
+    required: false
+    type: string
+    default: '[]'
+  template-file:
+    description: 'Path to the solution template file (single file mode)'
+    required: false
+  specification-file:
+    description: 'Path to the specification file (single file mode)'
+    required: false
+  metadata-file:
+    description: 'Path to the metadata file'
+    required: true
+  description:
+    description: 'Description of the solution template'
+    required: false
+  enable-external-validation:
+    description: 'Enable external validation for the solution template'
+    required: false
+    type: string
+  # Batch processing inputs
+  template-files:
+    description: 'JSON array of template file paths for batch processing'
+    required: false
+  specification-files:
+    description: 'JSON array of specification file paths (must match template-files order)'
+    required: false
+
+runs:
+  using: composite
+  steps:
+    - name: Determine Processing Mode
+      shell: bash
+      run: |
+        if [[ -n "${{ inputs.template-files }}" ]]; then
+          echo "PROCESSING_MODE=batch" >> $GITHUB_ENV
+          echo "Using batch processing mode"
+        elif [[ -n "${{ inputs.template-file }}" ]]; then
+          echo "PROCESSING_MODE=single" >> $GITHUB_ENV
+          echo "Using single file mode (backward compatibility)"
+        else
+          echo "Error: Either template-files or template-file must be provided"
+          exit 1
+        fi
+
+    - name: Process Solution Templates
+      id: process-templates
+      shell: bash
+      run: |
+        # Initialize counters and arrays for tracking results
+        TEMPLATES_CREATED=0
+        TEMPLATES_SKIPPED=0
+        TEMPLATES_FAILED=0
+        SKIPPED_TEMPLATES_DETAILS="[]"
+        FAILED_TEMPLATES_DETAILS="[]"
+        FILES_CREATED=false
+        TOTAL_PROCESSED=0
+        
+        # Read metadata once (common to all templates)
+        TEMPLATE_DESCRIPTION=$(yq eval '.description' "${{ inputs.metadata-file }}")
+        TEMPLATE_CAPABILITIES="[$(yq eval '.capabilities[]' "${{ inputs.metadata-file }}" | tr '\n' ',' | sed 's/,$//')]"
+        TEMPLATE_ENABLE_VALIDATION=$(yq eval '.enable-external-validation' "${{ inputs.metadata-file }}")
+        
+        # Override with input values if provided
+        if [[ -n "${{ inputs.description }}" ]]; then
+          TEMPLATE_DESCRIPTION="${{ inputs.description }}"
+        fi
+        if [[ "${{ inputs.capabilities }}" != "[]" ]]; then
+          TEMPLATE_CAPABILITIES="${{ inputs.capabilities }}"
+        fi
+        if [[ -n "${{ inputs.enable-external-validation }}" ]]; then
+          TEMPLATE_ENABLE_VALIDATION="${{ inputs.enable-external-validation }}"
+        fi
+        
+        echo "Common template settings:"
+        echo "  Description: $TEMPLATE_DESCRIPTION"
+        echo "  Capabilities: $TEMPLATE_CAPABILITIES"
+        echo "  Enable Validation: $TEMPLATE_ENABLE_VALIDATION"
+        
+        # Determine processing mode and prepare file arrays
+        if [[ "$PROCESSING_MODE" == "batch" ]]; then
+          echo "🔧 Batch mode: Processing multiple solution template files"
+          TEMPLATE_FILES='${{ inputs.template-files }}'
+          SPEC_FILES='${{ inputs.specification-files }}'
+          
+          # Validate array lengths
+          TEMPLATE_COUNT=$(echo "$TEMPLATE_FILES" | jq 'length')
+          SPEC_COUNT=$(echo "$SPEC_FILES" | jq 'length')
+          
+          if [[ $TEMPLATE_COUNT -ne $SPEC_COUNT ]]; then
+            echo "❌ Error: template-files and specification-files arrays must have the same length"
+            echo "Template files: $TEMPLATE_COUNT, Specification files: $SPEC_COUNT"
+            exit 1
+          fi
+          
+          echo "Processing $TEMPLATE_COUNT template files..."
+        else
+          echo "🔧 Single file mode: Processing ${{ inputs.template-file }}"
+          TEMPLATE_FILES='["${{ inputs.template-file }}"]'
+          SPEC_FILES='["${{ inputs.specification-file }}"]'
+        fi
+        
+        echo "Template files to process: $TEMPLATE_FILES"
+        echo "Spec files to process: $SPEC_FILES"
+        
+        # Process each template file
+        template_index=0
+        while IFS= read -r template_file; do
+          echo ""
+          echo "📄 Processing template file: $template_file"
+          
+          # Get corresponding spec file
+          spec_file=$(echo "$SPEC_FILES" | jq -r ".[$template_index]")
+          echo "   Spec file: $spec_file"
+          
+          # Initialize failure tracking for this file
+          FAILURE_REASON=""
+          FAILURE_DETAILS=""
+          TEMPLATE_NAME="unknown"
+          TEMPLATE_VERSION="unknown"
+          
+          # Validate template file exists and extract version from path
+          if [[ ! -f "$template_file" ]]; then
+            echo "❌ Template file not found: $template_file"
+            FAILURE_REASON="Template file not found"
+            FAILURE_DETAILS="Template file does not exist at specified path"
+            TEMPLATES_FAILED=$((TEMPLATES_FAILED + 1))
+            continue
+          fi
+          
+          if [[ ! -f "$spec_file" ]]; then
+            echo "❌ Specification file not found: $spec_file"
+            FAILURE_REASON="Specification file not found"
+            FAILURE_DETAILS="Specification file does not exist at specified path"
+            TEMPLATES_FAILED=$((TEMPLATES_FAILED + 1))
+            continue
+          fi
+          
+          # Extract version from path
+          if [[ "$template_file" =~ /solution-templates/([0-9]+\.[0-9]+\.[0-9]+)/ ]]; then
+            PATH_VERSION="${BASH_REMATCH[1]}"
+          else
+            echo "❌ Could not extract version from file path: $template_file"
+            FAILURE_REASON="Invalid path format"
+            FAILURE_DETAILS="Template file must be in a versioned directory (e.g., solution-templates/1.0.0/)"
+            TEMPLATES_FAILED=$((TEMPLATES_FAILED + 1))
+            
+            # Add failure details
+            ESCAPED_FILE=$(echo "$template_file" | sed 's/"/\\"/g')
+            FAILED_ENTRY=$(jq -n \
+              --arg file "$ESCAPED_FILE" \
+              --arg name "$TEMPLATE_NAME" \
+              --arg version "unknown" \
+              --arg error "$FAILURE_REASON" \
+              --arg details "$FAILURE_DETAILS" \
+              '{file: $file, "template-name": $name, version: $version, error: $error, "error-details": $details}')
+            
+            FAILED_TEMPLATES_DETAILS=$(echo "$FAILED_TEMPLATES_DETAILS" | jq --argjson entry "$FAILED_ENTRY" '. + [$entry]')
+            continue
+          fi
+          
+          # Read template metadata
+          TEMPLATE_NAME=$(yq eval '.metadata.name' "$template_file" 2>/dev/null || echo "")
+          TEMPLATE_VERSION=$(yq eval '.metadata.version' "$template_file" 2>/dev/null || echo "")
+          SCHEMA_NAME=$(yq eval '.schema.name' "$template_file" 2>/dev/null || echo "")
+          SCHEMA_VERSION=$(yq eval '.schema.version' "$template_file" 2>/dev/null || echo "")
+          
+          # Override with provided values if given (single file mode only)
+          if [[ "$PROCESSING_MODE" == "single" ]]; then
+            if [[ -n "${{ inputs.solution-template-name }}" ]]; then
+              TEMPLATE_NAME="${{ inputs.solution-template-name }}"
+            fi
+            if [[ -n "${{ inputs.solution-template-version }}" ]]; then
+              TEMPLATE_VERSION="${{ inputs.solution-template-version }}"
+            fi
+          fi
+          
+          # Check for version mismatch
+          if [[ "$TEMPLATE_VERSION" != "$PATH_VERSION" ]]; then
+            echo "❌ Version mismatch: File path version ($PATH_VERSION) does not match template version ($TEMPLATE_VERSION)"
+            FAILURE_REASON="Version mismatch"
+            FAILURE_DETAILS="File path version ($PATH_VERSION) does not match template version ($TEMPLATE_VERSION)"
+            TEMPLATES_FAILED=$((TEMPLATES_FAILED + 1))
+            
+            # Add failure details
+            ESCAPED_FILE=$(echo "$template_file" | sed 's/"/\\"/g')
+            ESCAPED_TEMPLATE_NAME=$(echo "$TEMPLATE_NAME" | sed 's/"/\\"/g')
+            FAILED_ENTRY=$(jq -n \
+              --arg file "$ESCAPED_FILE" \
+              --arg name "$ESCAPED_TEMPLATE_NAME" \
+              --arg version "$TEMPLATE_VERSION" \
+              --arg error "$FAILURE_REASON" \
+              --arg details "$FAILURE_DETAILS" \
+              '{file: $file, "template-name": $name, version: $version, error: $error, "error-details": $details}')
+            
+            FAILED_TEMPLATES_DETAILS=$(echo "$FAILED_TEMPLATES_DETAILS" | jq --argjson entry "$FAILED_ENTRY" '. + [$entry]')
+            continue
+          fi
+          
+          if [[ -z "$TEMPLATE_NAME" || -z "$TEMPLATE_VERSION" || -z "$SCHEMA_NAME" || -z "$SCHEMA_VERSION" ]]; then
+              echo "❌ Could not read template metadata from $template_file"
+              echo "   Template name: '$TEMPLATE_NAME'"
+              echo "   Template version: '$TEMPLATE_VERSION'" 
+              echo "   Schema name: '$SCHEMA_NAME'"
+              echo "   Schema version: '$SCHEMA_VERSION'"
+              FAILURE_REASON="Metadata parse error"
+              FAILURE_DETAILS="Could not read template name, version, schema name, or schema version from file - check YAML format"
+              
+              # Add failure details
+              ESCAPED_FILE=$(echo "$template_file" | sed 's/"/\\"/g')
+              FAILED_ENTRY=$(jq -n \
+                --arg file "$ESCAPED_FILE" \
+                --arg name "unknown" \
+                --arg version "unknown" \
+                --arg error "$FAILURE_REASON" \
+                --arg details "$FAILURE_DETAILS" \
+                '{file: $file, "template-name": $name, version: $version, error: $error, "error-details": $details}')
+              
+              FAILED_TEMPLATES_DETAILS=$(echo "$FAILED_TEMPLATES_DETAILS" | jq --argjson entry "$FAILED_ENTRY" '. + [$entry]')
+              TEMPLATES_FAILED=$((TEMPLATES_FAILED + 1))
+            else
+              echo "   Template: $TEMPLATE_NAME"
+              echo "   Version: $TEMPLATE_VERSION"
+              echo "   Schema: $SCHEMA_NAME v$SCHEMA_VERSION"
+              
+              # Check if required schema version exists
+              if ! az workload-orchestration schema version show \
+                    -g "${{ inputs.resource-group }}" \
+                    --schema-name "$SCHEMA_NAME" \
+                    -v "$SCHEMA_VERSION" >/dev/null 2>&1; then
+                echo "   ❌ Required schema does not exist: $SCHEMA_NAME v$SCHEMA_VERSION"
+                FAILURE_REASON="Schema does not exist"
+                FAILURE_DETAILS="Schema $SCHEMA_NAME v$SCHEMA_VERSION does not exist. Please ensure the schema and version exist before creating the solution template"
+                TEMPLATES_FAILED=$((TEMPLATES_FAILED + 1))
+                
+                # Add failure details
+                ESCAPED_FILE=$(echo "$template_file" | sed 's/"/\\"/g')
+                ESCAPED_TEMPLATE_NAME=$(echo "$TEMPLATE_NAME" | sed 's/"/\\"/g')
+                ESCAPED_TEMPLATE_VERSION=$(echo "$TEMPLATE_VERSION" | sed 's/"/\\"/g')
+                FAILED_ENTRY=$(jq -n \
+                  --arg file "$ESCAPED_FILE" \
+                  --arg name "$ESCAPED_TEMPLATE_NAME" \
+                  --arg version "$ESCAPED_TEMPLATE_VERSION" \
+                  --arg error "$FAILURE_REASON" \
+                  --arg details "$FAILURE_DETAILS" \
+                  '{file: $file, "template-name": $name, version: $version, error: $error, "error-details": $details}')
+                
+                FAILED_TEMPLATES_DETAILS=$(echo "$FAILED_TEMPLATES_DETAILS" | jq --argjson entry "$FAILED_ENTRY" '. + [$entry]')
+                continue
+              fi
+
+              # Check if template version already exists
+              if az workload-orchestration solution-template version show \
+                    -g "${{ inputs.resource-group }}" \
+                    --solution-template-name "$TEMPLATE_NAME" \
+                    -v "$TEMPLATE_VERSION" >/dev/null 2>&1; then
+                echo "   ⏭️  Solution template version already exists. Skipping creation."
+                TEMPLATES_SKIPPED=$((TEMPLATES_SKIPPED + 1))
+                
+                # Add to skipped templates details
+                ESCAPED_FILE=$(echo "$template_file" | sed 's/"/\\"/g')
+                ESCAPED_TEMPLATE_NAME=$(echo "$TEMPLATE_NAME" | sed 's/"/\\"/g')
+                ESCAPED_TEMPLATE_VERSION=$(echo "$TEMPLATE_VERSION" | sed 's/"/\\"/g')
+                
+                SKIPPED_ENTRY=$(jq -n \
+                  --arg file "$ESCAPED_FILE" \
+                  --arg name "$ESCAPED_TEMPLATE_NAME" \
+                  --arg version "$ESCAPED_TEMPLATE_VERSION" \
+                  --arg reason "Solution template version already exists" \
+                  '{file: $file, "template-name": $name, version: $version, reason: $reason}')
+                
+                SKIPPED_TEMPLATES_DETAILS=$(echo "$SKIPPED_TEMPLATES_DETAILS" | jq --argjson entry "$SKIPPED_ENTRY" '. + [$entry]')
+                continue
+              fi
+
+              echo "   Status: Creating new solution template..."
+              
+              # Create solution template - capture both stdout and stderr
+              if ! AZ_RESPONSE=$(az workload-orchestration solution-template create \
+                   -g "${{ inputs.resource-group }}" \
+                   -l "${{ inputs.location }}" \
+                   --capabilities "$TEMPLATE_CAPABILITIES" \
+                   --configuration-template-file "$template_file" \
+                   --specification "$spec_file" \
+                   --description "$TEMPLATE_DESCRIPTION" \
+                   --enable-external-validation "$TEMPLATE_ENABLE_VALIDATION" \
+                   --output json 2>&1); then
+                echo "   ❌ Failed to create solution template: $TEMPLATE_NAME v$TEMPLATE_VERSION"
+                FAILURE_REASON="Azure CLI creation failed"
+                FAILURE_DETAILS="$AZ_RESPONSE"
+                TEMPLATES_FAILED=$((TEMPLATES_FAILED + 1))
+                
+                # Add failure details
+                ESCAPED_FILE=$(echo "$template_file" | sed 's/"/\\"/g')
+                ESCAPED_TEMPLATE_NAME=$(echo "$TEMPLATE_NAME" | sed 's/"/\\"/g')
+                ESCAPED_TEMPLATE_VERSION=$(echo "$TEMPLATE_VERSION" | sed 's/"/\\"/g')
+                ESCAPED_RESPONSE=$(echo "$AZ_RESPONSE" | sed 's/"/\\"/g' | tr '\n' ' ')
+                FAILED_ENTRY=$(jq -n \
+                  --arg file "$ESCAPED_FILE" \
+                  --arg name "$ESCAPED_TEMPLATE_NAME" \
+                  --arg version "$ESCAPED_TEMPLATE_VERSION" \
+                  --arg error "$FAILURE_REASON" \
+                  --arg details "$ESCAPED_RESPONSE" \
+                  '{file: $file, "template-name": $name, version: $version, error: $error, "error-details": $details}')
+                
+                FAILED_TEMPLATES_DETAILS=$(echo "$FAILED_TEMPLATES_DETAILS" | jq --argjson entry "$FAILED_ENTRY" '. + [$entry]')
+                continue
+              fi
+
+              echo "   ✅ Successfully created solution template: $TEMPLATE_NAME v$TEMPLATE_VERSION"
+              TEMPLATES_CREATED=$((TEMPLATES_CREATED + 1))
+              FILES_CREATED=true
+              
+              # Extract resource IDs
+              SOLUTION_TEMPLATE_ID=$(echo "$AZ_RESPONSE" | jq -r '.properties.solutionTemplateId // empty')
+              SOLUTION_TEMPLATE_VERSION_ID=$(echo "$AZ_RESPONSE" | jq -r '.properties.solutionTemplateVersionId // empty')
+              
+              # Create metadata file
+              FOLDER_PATH=".pg/apps/${{ inputs.app-name }}/solutions"
+              mkdir -p "$FOLDER_PATH"
+              YAML_FILE="$FOLDER_PATH/$TEMPLATE_NAME.yaml"
+              
+              if [[ -f "$YAML_FILE" ]]; then
+                # Check if version already exists in file
+                EXISTING_VERSION=$(yq eval ".versions[] | select(.version == \"$TEMPLATE_VERSION\") | .version" "$YAML_FILE" 2>/dev/null || echo "")
+                if [[ -z "$EXISTING_VERSION" ]]; then
+                  yq eval ".versions += [{\"version\": \"$TEMPLATE_VERSION\", \"solutionTemplateVersionId\": \"$SOLUTION_TEMPLATE_VERSION_ID\", \"revisions\": []}]" -i "$YAML_FILE"
+                fi
+              else
+                # Create new file
+                yq eval -n '.solutionTemplateName = "'"$TEMPLATE_NAME"'"' > "$YAML_FILE"
+                yq eval '.solutionTemplateId = "'"$SOLUTION_TEMPLATE_ID"'"' -i "$YAML_FILE"
+                yq eval '.versions = []' -i "$YAML_FILE"
+                yq eval '.versions += [{"version": "'"$TEMPLATE_VERSION"'", "solutionTemplateVersionId": "'"$SOLUTION_TEMPLATE_VERSION_ID"'", "revisions": []}]' -i "$YAML_FILE"
+              fi
+            fi
+          
+          # If there was a failure, add to failed templates details
+          if [[ -n "$FAILURE_REASON" ]]; then
+            # Escape JSON strings properly
+            ESCAPED_FILE=$(echo "$template_file" | sed 's/"/\\"/g')
+            ESCAPED_TEMPLATE_NAME=$(echo "$TEMPLATE_NAME" | sed 's/"/\\"/g')
+            ESCAPED_TEMPLATE_VERSION=$(echo "$TEMPLATE_VERSION" | sed 's/"/\\"/g')
+            ESCAPED_REASON=$(echo "$FAILURE_REASON" | sed 's/"/\\"/g')
+            ESCAPED_DETAILS=$(echo "$FAILURE_DETAILS" | sed 's/"/\\"/g' | tr '\n' ' ')
+            
+            # Add failure details to JSON array
+            FAILED_ENTRY=$(jq -n \
+              --arg file "$ESCAPED_FILE" \
+              --arg name "$ESCAPED_TEMPLATE_NAME" \
+              --arg version "$ESCAPED_TEMPLATE_VERSION" \
+              --arg error "$ESCAPED_REASON" \
+              --arg details "$ESCAPED_DETAILS" \
+              '{file: $file, "template-name": $name, version: $version, error: $error, "error-details": $details}')
+            
+            FAILED_TEMPLATES_DETAILS=$(echo "$FAILED_TEMPLATES_DETAILS" | jq --argjson entry "$FAILED_ENTRY" '. + [$entry]')
+          fi
+          
+          TOTAL_PROCESSED=$((TOTAL_PROCESSED + 1))
+          template_index=$((template_index + 1))
+        done < <(echo "$TEMPLATE_FILES" | jq -r '.[]')
+        
+        # Compact JSON arrays for output
+        SKIPPED_TEMPLATES_COMPACT=$(echo "$SKIPPED_TEMPLATES_DETAILS" | jq -c .)
+        FAILED_TEMPLATES_COMPACT=$(echo "$FAILED_TEMPLATES_DETAILS" | jq -c .)
+        
+        # Set all outputs
+        echo "files_created=$FILES_CREATED" >> $GITHUB_OUTPUT
+        echo "templates_skipped=$TEMPLATES_SKIPPED" >> $GITHUB_OUTPUT
+        echo "templates_failed=$TEMPLATES_FAILED" >> $GITHUB_OUTPUT
+        echo "skipped_templates_details=$SKIPPED_TEMPLATES_COMPACT" >> $GITHUB_OUTPUT
+        echo "failed_templates_details=$FAILED_TEMPLATES_COMPACT" >> $GITHUB_OUTPUT
+        
+        echo ""
+        echo "📊 Solution Template Processing Summary:"
+        echo "   Total processed: $TOTAL_PROCESSED"
+        echo "   Templates created: $TEMPLATES_CREATED"
+        echo "   Templates skipped: $TEMPLATES_SKIPPED"
+        echo "   Templates failed: $TEMPLATES_FAILED"
+        echo "   Files created: $FILES_CREATED"
+        
+        # Show detailed skipped information if there are skipped templates
+        if [[ "$TEMPLATES_SKIPPED" -gt 0 ]]; then
+          echo ""
+          echo "⏭️ Skipped Templates Details:"
+          echo "$SKIPPED_TEMPLATES_DETAILS" | jq -r '.[] | "   - \(.["template-name"]) v\(.version) (\(.file))"'
+        fi
+        
+        # Show detailed failure information if there are failures
+        if [[ "$TEMPLATES_FAILED" -gt 0 ]]; then
+          echo ""
+          echo "❌ Failed Templates Details:"
+          echo "$FAILED_TEMPLATES_DETAILS" | jq -r '.[] | "   - \(.["template-name"]) v\(.version): \(.error) (\(.file))"'
+          
+          echo ""
+          echo "🔍 Detailed Error Information:"
+          echo "$FAILED_TEMPLATES_DETAILS" | jq -r '.[] | "   File: \(.file)\n   Template: \(.["template-name"]) v\(.version)\n   Error: \(.error)\n   Details: \(.["error-details"])\n"'
+        fi

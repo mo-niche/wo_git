@@ -1,0 +1,135 @@
+name:  wo-check-woready-cluster
+description: check if this cluster is WO ready
+inputs:
+  site:
+    description: site used for cluster
+    required: true
+  rg:
+    description: RG to be used for cluster
+    required: true
+outputs:
+  akscls:
+    description: indicates if AKS cluster already exists
+    value: ${{ steps.akswoready.outputs.akscls }}
+  akscon:
+    description: indicates if AKS cluster is arc connected
+    value: ${{ steps.akswoready.outputs.akscon }}
+  cusloc:
+    description: indicate if AKS cluster customLoc exists
+    value: ${{ steps.akswoready.outputs.cusloc }}
+  woextn:
+    description: indicates if connected cluster is has WO extn
+    value: ${{ steps.akswoready.outputs.woextn }}
+  aiocrt:
+    description: indicates if connected cluster is has aiocert extn
+    value: ${{ steps.akswoready.outputs.aiocrt }}
+  woready:
+    description: indicates if connected cluster is WO ready
+    value: ${{ steps.akswoready.outputs.woready }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: source site info
+      id: siteinfo
+      uses: ./.github/actions/wo-get-site-info
+      with:
+        site: ${{ inputs.site }}
+        rg: ${{ inputs.rg }}
+
+    - name: check for cluster details
+      id: akswoready
+      shell: bash
+      run: |
+        akscls="true"
+        akscon="false"
+        cusloc="false"
+        aiocrt="false"
+        woextn="false"
+        woready="false"
+
+
+        # echo "get aks credentials ..."
+        # az aks get-credentials --resource-group ${{ steps.siteinfo.outputs.rg }} --name ${{ steps.siteinfo.outputs.siteClsName }} --overwrite-existing
+        # kubectl config use-context ${{ steps.siteinfo.outputs.siteClsName }}
+
+        echo "CHECK IF THIS IS A CONNECTED CLUSTER"
+        echo "usingrg: ${{ steps.siteinfo.outputs.rg }} and inputrg: ${{ inputs.rg }}"
+        aksctd=$(az connectedk8s show --resource-group "${{ steps.siteinfo.outputs.rg }}" --name "${{ steps.siteinfo.outputs.siteClsName }}" --subscription "${{ steps.siteinfo.outputs.subId }}" --query name -o tsv 2>&1) || true
+
+        if [[ "$aksctd" == "${{ steps.siteinfo.outputs.siteClsName }}" ]]; then
+          echo " ---> CONNECTED CLUSTER verified: ${{ steps.siteinfo.outputs.siteClsName }}"
+          akscon="true"
+          akscls="true"
+        else
+          echo " ---> CONNECTED CLUSTER DOES NOT EXIST"
+          akscon="false"
+        fi
+
+        echo "CHECK IF CUSTOMLOCATION IS ENABLED ON CONNECTED CLUSTER"
+        concls=$(az customlocation show --resource-group "${{ steps.siteinfo.outputs.rg }}" --name "${{ steps.siteinfo.outputs.sitecusLocName }}" --subscription "${{ steps.siteinfo.outputs.subId }}" --query name -o tsv 2>&1) || true
+
+        if [[ "$concls" == "${{ steps.siteinfo.outputs.sitecusLocName }}" ]]; then
+          echo " ---> CustomLocation verified: ${{ steps.siteinfo.outputs.sitecusLocName }}"
+          akscon="true"
+          akscls="true"
+          cusloc="true"
+        else
+          echo " ---> CustomLocation does not exist"
+          akscon="true"
+          akscls="true"
+          cusloc="false"
+        fi
+
+        echo "check for aio-certmgr extension ... "
+        aio=$(az rest --method GET \
+             --resource https://management.azure.com \
+             --url "https://management.azure.com/subscriptions/${{ steps.siteinfo.outputs.subId }}/resourceGroups/${{ steps.siteinfo.outputs.rg }}/providers/Microsoft.Kubernetes/connectedClusters/${{ steps.siteinfo.outputs.siteClsName }}/Providers/Microsoft.KubernetesConfiguration/extensions/aio-certmgr?api-version=2023-05-01" --query name -o tsv 2>&1) || true
+
+        if [[ "$aio" == "aio-certmgr" ]]; then 
+          echo " ---> aiocert extension exists"
+          aiocrt="true"
+        else
+          echo " ---> missing extension: aio-certmgr "
+        fi
+
+        echo "check for workload-orchestration extension ... "
+        wo=$(az rest --method GET \
+             --resource https://management.azure.com \
+             --url "https://management.azure.com/subscriptions/${{ steps.siteinfo.outputs.subId }}/resourceGroups/${{ steps.siteinfo.outputs.rg }}/providers/Microsoft.Kubernetes/connectedClusters/${{ steps.siteinfo.outputs.siteClsName }}/Providers/Microsoft.KubernetesConfiguration/extensions/${{ steps.siteinfo.outputs.extnName }}?api-version=2023-05-01" --query name -o tsv 2>&1) || true
+
+        if [[ "$wo" == "${{ steps.siteinfo.outputs.extnName }}" ]]; then 
+          echo " ---> wo extension exists"
+          woextn="true"
+        else
+          echo " ---> missing extension: workloadorchestration "
+        fi
+       
+        if [[ ("$woextn" == "true") && ("$aiocrt" == "true") && ("$cusloc" == "true") && ("$akscon" == "true") && ("$akscls" == "true") ]]; then
+
+          woready="true"
+          echo "woready=true" >> "$GITHUB_OUTPUT"
+          echo "akscls=true" >> "$GITHUB_OUTPUT"
+          echo "akscon=true" >> "$GITHUB_OUTPUT"
+          echo "cusloc=true" >> "$GITHUB_OUTPUT"
+          echo "woextn=true" >> "$GITHUB_OUTPUT"
+          echo "aiocrt=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "akscls=$akscls" >> $GITHUB_OUTPUT       
+          echo "akscon=$akscon" >> $GITHUB_OUTPUT       
+          echo "cusloc=$cusloc" >> $GITHUB_OUTPUT       
+          echo "woextn=$woextn" >> $GITHUB_OUTPUT
+          echo "aiocrt=$aiocrt" >> $GITHUB_OUTPUT
+          echo "woready=$woready" >> $GITHUB_OUTPUT
+        fi
+
+        echo " " 
+        echo "-- current state of readiness --"
+        echo "Cluster present  :    $akscls"       
+        echo "ConnectedCluster :    $akscon"       
+        echo "CustLoc Enabled  :    $cusloc"       
+        echo "--- Extensions ---"       
+        echo "AIO-Certmgr      :    $aiocrt"
+        echo "WorkloadOrchestr :    $woextn"
+        echo "--------------------------------"
+        echo "Cluster WO readiness: $woready"

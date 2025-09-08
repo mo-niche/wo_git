@@ -1,0 +1,48 @@
+common:
+
+  ## DATAFILL TENANT AND SUBSCRIPTION INFO <<<<<--- 
+
+  tenantId: "<TENANT_ID>"
+  subscriptionId: "<SUBSCRIPTION_ID>"
+  rg: "<RESOURCEGROUP>"
+  location: "<LOCATION>"
+
+context:
+
+  ## DATAFILL CONTEXT INFO <<<<<----
+
+  contextRG: "<CONTEXT-RG>"
+  contextName: "<CONTEXT-NAME>"
+  contextLocation: "<CONTEXT-LOCATION>"
+  contextTenantId: "<TENANT_ID of CONTEXT-NAME>"
+  contextSubscriptionId: "<SUBID of CONTEXT-NAME>"
+
+capabilities:
+  - name: "azure-soap"
+    description: "soap"
+  - name: "azure-shampoo"
+    description: "Shampoo"
+
+sites:
+  siteList: "albany,bethel,canton,denver,eugene,frisco,graham,houston,tanzu"
+ 
+hierarchy:
+  levels: "country,region,factory,line"
+
+providerAppId:
+# Usage: for various role assignments
+# providerOid=$(az ad sp show --id "$providerAppId" --query "id" --output "tsv")
+# az role assignment create --assignee "$providerOid" ...
+
+  customlocation: "bc313c14-388c-4e7d-a58e-70017303ee3b"
+  workloadorchestration: "cba491bc-48c0-44a6-a6c7-23362a7f54a9"
+  eventgrid: "4962773b-9cdb-44cf-a8bf-237846a00ab7"
+
+workloadorchestration:
+  extensionVer: "2.1.2"
+  extensionName: "workloadorchestration"
+  release-train: "stable"
+  extensionScope: "cluster"
+
+endpoint:
+  endpoint-resource-manager: "https://management.azure.com"

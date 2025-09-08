@@ -1,0 +1,31 @@
+target:
+  frisco:
+    - name: "fsc-ft-1"
+      level: "factory"
+      caps:
+        - azure-soap
+        - azure-shampoo
+      scope: "frisco"
+      spec: "targetspecs.json"
+      # system updated
+      targetId: ""
+
+    - name: "fsc-li-1"
+      level: "line"
+      caps:
+        - azure-soap
+        - azure-shampoo
+      scope: "frisco"
+      spec: "targetspecs.json"
+      # system updated
+      targetId: ""
+
+    - name: "fsc-li-2"
+      level: "line"
+      caps:
+        - azure-soap
+        - azure-shampoo
+      scope: "frisco"
+      spec: "targetspecs.json"
+      #system updated
+      targetId: ""

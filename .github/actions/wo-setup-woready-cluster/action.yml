@@ -1,0 +1,167 @@
+name:  Make cluster wo ready
+description: Create a workload-orchestration ready cluster
+inputs:
+  site:
+    description: Site name, e.g., austin, boston, etc.
+    required: true
+  rg:
+    description: RG to be used for AKS cluster
+    required: true
+  akscls:
+    description: indicates if AKS cluster already exists
+    required: true
+  akscon:
+    description: indicates if AKS cluster is arc connected
+    required: true
+  cusloc:
+    description: indicate if AKS cluster customLoc exists
+    required: true
+  woextn:
+    description: indicates if connected cluster is has WO extn
+    required: true
+  aiocrt:
+    description: indicates if connected cluster is has aiocert extn
+    required: true
+outputs:
+  custLocId:
+    value: ${{ steps.custloc.outputs.custLocId }}
+    description: The custom location namespace
+
+runs:
+  using: "composite"
+  steps:
+
+    - name: source site info
+      id: siteinfo
+      uses: ./.github/actions/wo-get-site-info
+      with:
+        site: ${{ inputs.site }}
+        rg: ${{ inputs.rg }}
+
+    - name: install cert manager
+      if: ${{ inputs.aiocrt == 'false' }}
+      shell: bash
+      run: |
+        echo " "
+        echo "INSTALL aio-certmgr manager extension"
+        az k8s-extension create --resource-group ${{ steps.siteinfo.outputs.rg }} --cluster-name ${{ steps.siteinfo.outputs.siteClsName }} --name "aio-certmgr" \
+                                --cluster-type connectedClusters --extension-type microsoft.iotoperations.platform --scope cluster --release-namespace cert-manager \
+                                --subscription ${{ steps.siteinfo.outputs.subId }}
+
+    - name: install workloadorchestration extension
+      if: ${{ inputs.woextn == 'false' }}
+      shell: bash
+      run: |
+        # az cloud update --endpoint-resource-manager "https://eastus2euap.management.azure.com"
+        echo " "
+        echo "INSTALL workload orchestration extension"
+        az k8s-extension create --resource-group ${{ steps.siteinfo.outputs.rg }} --cluster-name ${{ steps.siteinfo.outputs.siteClsName }} \
+                                --cluster-type connectedClusters --name ${{ steps.siteinfo.outputs.extnName }} --extension-type Microsoft.workloadorchestration --scope cluster \
+                                --release-train stable --version ${{ steps.siteinfo.outputs.extnVer }} --auto-upgrade false --config redis.persistentVolume.storageClass="default" \
+                                --config redis.persistentVolume.size=20Gi --subscription ${{ steps.siteinfo.outputs.subId }}
+
+    - name: get cluster and wo extension details
+      id: extension
+      shell: bash
+      run: |
+        echo "clusterId=$(az connectedk8s show --resource-group ${{ steps.siteinfo.outputs.rg }} --name ${{ steps.siteinfo.outputs.siteClsName }} \
+                                               --subscription ${{ steps.siteinfo.outputs.subId }} --query id --output tsv)" >> $GITHUB_OUTPUT
+        echo "extensionId=$(az k8s-extension show --resource-group ${{ steps.siteinfo.outputs.rg }} --name ${{ steps.siteinfo.outputs.extnName }} --cluster-type connectedClusters \
+                                                  --cluster-name ${{ steps.siteinfo.outputs.siteClsName }} --subscription ${{ steps.siteinfo.outputs.subId }} --query id --output tsv)" >>  $GITHUB_OUTPUT
+
+    - name: get custLoc OID for Service Principals
+      # echo "sp-cl-oid=$(az ad sp show --id bc313c14-388c-4e7d-a58e-70017303ee3b --query id -bc313c14-388c-4e7d-a58e-70017303ee3bo tsv)" >> $GITHUB_OUTPUT
+      # hard coded in MSFT tenant (az ad sp show --id <providerAppId> --query id -o tsv) 
+      id: custLocOid
+      shell: bash
+      run: |
+        ## echo "sp-cl-oid=$(az ad sp show --id bc313c14-388c-4e7d-a58e-70017303ee3b --query id -o tsv)" >> $GITHUB_OUTPUT
+        echo "sp-cl-oid=fdd7a0b6-5677-4f64-ad82-3a79f4725083" >> $GITHUB_OUTPUT
+
+        ## For MSFT tenant, hard code value
+        ## echo "sp-cl-oid=51dfe1e8-70c6-4de5-a08e-e18aff23d815" >> $GITHUB_OUTPUT
+
+    - name: setup connectedcluster proxy
+      id: connectedclusterproxy
+      shell: bash
+      run: |
+        echo "get connectedcluster proxy ..."
+        az connectedk8s proxy --resource-group ${{ steps.siteinfo.outputs.rg }} --name ${{ steps.siteinfo.outputs.siteClsName }} --subscription ${{ steps.siteinfo.outputs.subId }} &
+        sleep 30 # Give the proxy time to start
+        export KUBECONFIG="$HOME/.kube/config"
+
+    - name: execute kubectl
+      shell: bash
+      run: |
+        echo "kubectl commands ..."
+        export KUBECONFIG="$HOME/.kube/config"
+        kubectl config current-context
+
+    - name: create and enable customelocation for cluster
+      id: custloc
+      shell: bash
+      run: |
+        echo " "
+        echo "ENABLE CUSTOMLOCATION on the cluster"
+        temp=${{ inputs.cusloc }}
+
+        # extract value from existing custom location and return
+        if [[ $temp == "true" ]]; then
+          echo 
+          echo "customlocation already exists. extract cusLocId  ...."
+          echo "custLocId=$(az customlocation show --name ${{ steps.siteinfo.outputs.sitecusLocName }} \
+                               --resource-group ${{ steps.siteinfo.outputs.rg }} --subscription ${{ steps.siteinfo.outputs.subId }} --query id -o tsv)" >> $GITHUB_OUTPUT
+          exit 0
+        fi
+        
+        # create customlocation and return custLocId
+        # set kubeconfig context
+        echo " show current context ..."
+        export KUBECONFIG="$HOME/.kube/config"
+
+        # only for AKS clusters
+        if [[ "${{ inputs.akscls }}" == "true" ]]; then
+        
+          echo "get aks credentials ..."
+          az aks get-credentials --resource-group ${{ steps.siteinfo.outputs.rg }} --name ${{ steps.siteinfo.outputs.siteClsName }} \
+                                 --subscription ${{ steps.siteinfo.outputs.subId }} --overwrite-existing
+          kubectl config use-context ${{ steps.siteinfo.outputs.siteClsName }}
+
+          echo 
+          echo " enable-features ...."
+          az connectedk8s enable-features -n ${{ steps.siteinfo.outputs.siteClsName }} -g ${{ steps.siteinfo.outputs.rg }} --subscription ${{ steps.siteinfo.outputs.subId }} \
+                                         --custom-locations-oid ${{ steps.custLocOid.outputs.sp-cl-oid }} --features cluster-connect custom-locations
+
+        fi
+
+        echo 
+        echo " customlocation create ...."
+        az customlocation create --resource-group ${{ steps.siteinfo.outputs.rg }} --name ${{ steps.siteinfo.outputs.sitecusLocName }} \
+                                 --namespace default --host-resource-id ${{ steps.extension.outputs.clusterId }} \
+                                 --cluster-extension-ids ${{ steps.extension.outputs.extensionId }} --location  ${{ steps.siteinfo.outputs.siteLoc }} \
+                                 --subscription ${{ steps.siteinfo.outputs.subId }}
+        
+        echo 
+        echo " extract customlocation Id ...."
+        echo "custLocId=$(az customlocation show --name ${{ steps.siteinfo.outputs.sitecusLocName }} --subscription ${{ steps.siteinfo.outputs.subId }} \
+                                 --resource-group ${{ steps.siteinfo.outputs.rg }} --query id -o tsv)" >> $GITHUB_OUTPUT
+
+    - name: Checkout
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: update custlocId
+      shell: bash
+      run: |
+        yq -i ".name = \"${{ steps.custLoc.outputs.custLocId }}\"" .pg/sites/${{ inputs.site }}/custom-location.json
+        echo "Updated CL: .pg/sites/${{ inputs.site }}/custom-location.json"
+
+    - name: get latest changes
+      shell: bash
+      run: |
+        git pull origin main
+
+    - name: update custom-location
+      # Commit all changed files back to the repository
+      uses: stefanzweifel/git-auto-commit-action@v5

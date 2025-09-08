@@ -1,0 +1,1588 @@
+name: WO-CM-ONBOARDING-V2
+
+# Add concurrency control to prevent multiple instances running simultaneously
+concurrency:
+  group: wo-cm-onboarding-v2-${{ github.ref }}
+  cancel-in-progress: false
+
+on:
+  push:
+    branches:
+      - main
+    paths: 
+      - '.pg/**/workload-orchestration/**'
+      - '.pg/apps/common/**'
+  workflow_run:
+      workflows: ["WO-SYNC-VERSIONS-V2"]
+      types:
+        - completed
+
+  workflow_dispatch:
+    inputs:
+      update_common:
+        type: choice
+        description: 'Choose what common resources to update'
+        default: none
+        options:
+        - none
+        - schema-only
+        - config-only
+        - all
+        required: true
+      action:
+        type: choice
+        description: Choose app resources to update
+        default: none
+        options:
+        - none
+        - create-schema
+        - create-soln-template
+        - all
+        required: true
+      apps:
+        type: string
+        description: 'Comma-separated list of apps to update (e.g., testapp1,testapp2)'
+        default: null
+      schema_versions:
+        type: string
+        description: 'Comma-separated list of schema versions to process (e.g., 1.0.0,2.0.0)'
+        default: null
+      solution_template_versions:
+        type: string
+        description: 'Comma-separated list of solution template versions to process (e.g., 1.0.0,2.0.0)'
+        default: null
+      usesiterg:
+        type: string
+        description: 'RG OVERRIDE - Leave empty to use default from wo-common.yaml'
+        default: ""
+
+permissions:
+  id-token: write # 
+  contents: write # for actions/checkout
+
+jobs:
+  update-context:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Azure Login with OIDC
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          enable-AzPSSession: true
+
+      - uses: actions/checkout@v4
+
+      - name: Source composite actions
+        uses: ./.github/actions/wo-utilities/
+        with:
+          utilities: "yq"
+
+      - name: Install Workload Orchestration Extension
+        uses: ./.github/actions/wo-install-wo-extension
+
+      - name: Update Context
+        uses: ./.github/actions/wo-update-context
+
+  detect-apps-resources-to-update:
+    needs: update-context
+    runs-on: ubuntu-latest
+    outputs:
+      apps: ${{ github.event_name == 'workflow_dispatch' && steps.app-list-dispatch.outputs.apps || steps.app-list.outputs.apps }}
+      app_changes: ${{ steps.detect-changes.outputs.app_changes }}
+      root_template_changes: ${{ steps.detect-changes.outputs.root_template_changes }}
+    steps:
+      - name: Git Info
+        id: check-author
+        run: |
+          echo "Actor: ${{ github.actor }}"
+          echo "Event: ${{ github.event_name }}"
+
+      - uses: actions/checkout@v4
+      
+      - name: Check changed files
+        if: github.event_name == 'push' || github.event_name == 'workflow_run'
+        id: changed-files
+        uses: ./.github/actions/wo-changed-files
+        with:
+          files: .pg/**/*
+          
+      - name: Extract apps with changes
+        if: github.event_name == 'push' || github.event_name == 'workflow_run'
+        id: app-list
+        run: |
+          # Get all changed files and extract unique app names
+          APPS=$(echo "${{ steps.changed-files.outputs.all_changed_files }}" | 
+                 grep -o '\.pg/apps/[^/]*/' | 
+                 sed 's/\.pg\/apps\///' | 
+                 sed 's/\///' | 
+                 grep -v '^common$' | 
+                 sort -u | 
+                 jq -R -s -c 'split("\n")[:-1]')
+          echo "apps=$APPS" >> $GITHUB_OUTPUT
+
+      - name: Detect versioned file changes only
+        if: github.event_name == 'push' || github.event_name == 'workflow_run'
+        id: detect-changes
+        run: |
+          # Initialize app changes object and root template changes array
+          APP_CHANGES="{}"
+          ROOT_TEMPLATE_CHANGES="[]"
+          
+          # Get all changed files
+          CHANGED_FILES="${{ steps.changed-files.outputs.all_changed_files }}"
+          
+          # Filter out deleted files before processing
+          EXISTING_FILES=""
+          while IFS= read -r file; do
+            if [[ -f "$file" ]]; then
+              EXISTING_FILES="$EXISTING_FILES $file"
+            else
+              echo "Skipping deleted file: $file"
+            fi
+          done <<< "$(echo "$CHANGED_FILES" | tr ' ' '\n')"
+          
+          # Process each existing changed file - ONLY process versioned files
+          while IFS= read -r file; do
+            app_name=""
+            folder_type=""
+            version=""
+            
+            # Check for versioned schema files
+            if [[ "$file" =~ ^\.pg/apps/([^/]+)/workload-orchestration/(schemas)/([0-9]+\.[0-9]+\.[0-9]+)/ ]]; then
+              app_name="${BASH_REMATCH[1]}"
+              folder_type="${BASH_REMATCH[2]}"
+              version="${BASH_REMATCH[3]}"
+            # Check for versioned solution-template files (.yaml or .json)
+            elif [[ "$file" =~ ^\.pg/apps/([^/]+)/workload-orchestration/(solution-templates)/([0-9]+\.[0-9]+\.[0-9]+)/.*\.(yaml|json)$ ]]; then
+              app_name="${BASH_REMATCH[1]}"
+              folder_type="${BASH_REMATCH[2]}"
+              version="${BASH_REMATCH[3]}"
+            # Check for ROOT-LEVEL solution template files (not in version subdirectories)
+            elif [[ "$file" =~ ^\.pg/apps/([^/]+)/workload-orchestration/solution-templates/([^/]+)\.yaml$ ]]; then
+              root_app_name="${BASH_REMATCH[1]}"
+              root_filename="${BASH_REMATCH[2]}.yaml"
+              
+              # Only process solution template files, skip common app and ignore standalone specs.json changes
+              if [[ "$root_app_name" != "common" && "$root_filename" =~ -template\.yaml$ ]]; then
+                echo "Found root-level template change: $root_app_name - $file"
+                
+                # Add to root template changes
+                ROOT_TEMPLATE_CHANGES=$(echo "$ROOT_TEMPLATE_CHANGES" | jq --arg app "$root_app_name" --arg file "$file" '. + [{"app": $app, "file": $file}]')
+              fi
+            # Check for ROOT-LEVEL schema files (not in version subdirectories)
+            elif [[ "$file" =~ ^\.pg/apps/([^/]+)/workload-orchestration/schemas/([^/]+)\.yaml$ ]]; then
+              root_app_name="${BASH_REMATCH[1]}"
+              root_filename="${BASH_REMATCH[2]}.yaml"
+              
+              # Only process schema files, skip common app
+              if [[ "$root_app_name" != "common" && "$root_filename" =~ -schema\.yaml$ ]]; then
+                echo "Found root-level schema change: $root_app_name - $file"
+                
+                # Add to root template changes
+                ROOT_TEMPLATE_CHANGES=$(echo "$ROOT_TEMPLATE_CHANGES" | jq --arg app "$root_app_name" --arg file "$file" '. + [{"app": $app, "file": $file}]')
+              fi
+            fi
+            
+            # Process the versioned file if it matched one of the patterns
+            if [[ -n "$app_name" && -n "$folder_type" && -n "$version" ]]; then
+              # Skip common app processing here (handled separately)
+              if [[ "$app_name" == "common" ]]; then
+                continue
+              fi
+              
+              echo "Found versioned change: $app_name/$folder_type/$version - $file"
+              
+              # Initialize app entry if it doesn't exist
+              if [[ $(echo "$APP_CHANGES" | jq -r --arg app "$app_name" '.[$app]') == "null" ]]; then
+                APP_CHANGES=$(echo "$APP_CHANGES" | jq --arg app "$app_name" '.[$app] = {"schemas": [], "solution-templates": []}')
+              fi
+              
+              # Update the appropriate versioned array
+              if [[ "$folder_type" == "schemas" ]]; then
+                APP_CHANGES=$(echo "$APP_CHANGES" | jq --arg app "$app_name" --arg version "$version" '.[$app].schemas |= if . | index($version) then . else . + [$version] end')
+              elif [[ "$folder_type" == "solution-templates" ]]; then
+                APP_CHANGES=$(echo "$APP_CHANGES" | jq --arg app "$app_name" --arg version "$version" '.[$app]["solution-templates"] |= if . | index($version) then . else . + [$version] end')
+              fi
+            fi
+          done <<< "$(echo "$EXISTING_FILES" | tr ' ' '\n')"
+          
+          # Write to temporary files and read back (to handle while loop subshell issue)
+          echo "$APP_CHANGES" > /tmp/app_changes.json
+          echo "$ROOT_TEMPLATE_CHANGES" > /tmp/root_template_changes.json
+          APP_CHANGES_FINAL=$(cat /tmp/app_changes.json)
+          ROOT_TEMPLATE_CHANGES_FINAL=$(cat /tmp/root_template_changes.json)
+          
+          # Compact the JSON to prevent GitHub Actions output formatting issues
+          APP_CHANGES_COMPACT=$(echo "$APP_CHANGES_FINAL" | jq -c .)
+          ROOT_TEMPLATE_CHANGES_COMPACT=$(echo "$ROOT_TEMPLATE_CHANGES_FINAL" | jq -c .)
+          
+          echo "app_changes=$APP_CHANGES_COMPACT" >> $GITHUB_OUTPUT
+          echo "root_template_changes=$ROOT_TEMPLATE_CHANGES_COMPACT" >> $GITHUB_OUTPUT
+          echo "Detected versioned app changes:"
+          echo "$APP_CHANGES_FINAL" | jq .
+          echo "Detected root-level template changes:"
+          echo "$ROOT_TEMPLATE_CHANGES_FINAL" | jq .
+
+      - name: Extract and validate apps for update
+        if: github.event_name == 'workflow_dispatch'
+        id: app-list-dispatch
+        run: |
+          echo "Validating apps from input list for update..."
+          APPS_INPUT="${{ github.event.inputs.apps }}"
+          
+          # Handle empty or whitespace-only input
+          if [[ -z "${APPS_INPUT// }" ]]; then
+            echo "⚠️ Empty app list provided"
+            echo "apps=[]" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          VALID_APPS=()
+
+          # Process each app
+          IFS=',' read -ra APP_LIST <<< "$APPS_INPUT"
+          for app in "${APP_LIST[@]}"; do
+            # Trim whitespace
+            app=$(echo "$app" | xargs)
+            
+            # Validate app directory exists
+            if [[ -d ".pg/apps/$app" ]]; then
+              VALID_APPS+=("$app")
+              echo "✅ Validated app: $app"
+            else
+              echo "❌ Warning: Directory .pg/apps/$app does not exist, skipping"
+            fi
+          done
+
+          # Convert validated apps to JSON array, filtering out any empty strings
+          APPS=$(printf '%s\n' "${VALID_APPS[@]}" | jq -R -s -c 'split("\n") | map(select(length > 0))')
+          echo "apps=$APPS" >> $GITHUB_OUTPUT
+          echo "✅ Final app list: $APPS"
+
+  manage-version-folders:
+    needs: [detect-apps-resources-to-update]
+    runs-on: ubuntu-latest
+    outputs:
+      folders_created: ${{ steps.create-folders.outputs.folders_created }}
+      files_updated: ${{ steps.create-folders.outputs.files_updated }}
+      processed_versions: ${{ steps.create-folders.outputs.processed_versions }}
+      merged_apps: ${{ steps.merge-apps.outputs.merged_apps }}
+      merged_app_changes: ${{ steps.merge-apps.outputs.merged_app_changes }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+          fetch-depth: 0
+
+      - name: Source composite actions
+        uses: ./.github/actions/wo-utilities/
+        with:
+          utilities: "yq"
+
+      - name: Create version folders and copy files
+        id: create-folders
+        run: |
+          set -e
+          
+          ROOT_TEMPLATE_CHANGES='${{ needs.detect-apps-resources-to-update.outputs.root_template_changes }}'
+          FOLDERS_CREATED="false"
+          FILES_UPDATED="false"
+          PROCESSED_VERSIONS="{}"
+          
+          echo "Processing root template changes..."
+          echo "$ROOT_TEMPLATE_CHANGES" | jq .
+          
+          # Process each changed file
+          echo "$ROOT_TEMPLATE_CHANGES" | jq -c '.[]' | while read -r change; do
+            APP_NAME=$(echo "$change" | jq -r '.app')
+            FILE_PATH=$(echo "$change" | jq -r '.file')
+            
+            echo ""
+            echo "Processing: $APP_NAME - $FILE_PATH"
+            
+            # Check if file exists
+            if [[ ! -f "$FILE_PATH" ]]; then
+              echo "⚠️ Warning: File not found: $FILE_PATH"
+              continue
+            fi
+            
+            # Extract version from metadata (only for YAML files)
+            if [[ "$FILE_PATH" =~ \.yaml$ ]]; then
+              VERSION=$(yq eval '.metadata.version' "$FILE_PATH" 2>/dev/null || echo "")
+            else
+              echo "⚠️ Warning: Unsupported file type: $FILE_PATH"
+              continue
+            fi
+            
+            if [[ -z "$VERSION" || "$VERSION" == "null" ]]; then
+              echo "⚠️ Warning: Could not extract version from $FILE_PATH"
+              continue
+            fi
+            
+            # Validate version format (semantic versioning)
+            if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "⚠️ Warning: Invalid version format '$VERSION' in $FILE_PATH (expected X.Y.Z)"
+              continue
+            fi
+            
+            echo "✅ Extracted version: $VERSION"
+            
+            # Determine target directory based on file path
+            if [[ "$FILE_PATH" =~ /workload-orchestration/solution-templates/ ]]; then
+              BASE_DIR=".pg/apps/$APP_NAME/workload-orchestration/solution-templates"
+              FOLDER_TYPE="solution-templates"
+            elif [[ "$FILE_PATH" =~ /workload-orchestration/schemas/ ]]; then
+              BASE_DIR=".pg/apps/$APP_NAME/workload-orchestration/schemas"
+              FOLDER_TYPE="schemas"
+            else
+              echo "⚠️ Warning: Unknown file path pattern: $FILE_PATH"
+              continue
+            fi
+            
+            VERSION_DIR="$BASE_DIR/$VERSION"
+            FILENAME=$(basename "$FILE_PATH")
+            TARGET_FILE="$VERSION_DIR/$FILENAME"
+            
+            echo "Target directory: $VERSION_DIR (type: $FOLDER_TYPE)"
+            echo "Target file: $TARGET_FILE"
+            
+            # Create version directory if it doesn't exist
+            if [[ ! -d "$VERSION_DIR" ]]; then
+              echo "Creating version directory: $VERSION_DIR"
+              mkdir -p "$VERSION_DIR"
+              FOLDERS_CREATED="true"
+            else
+              echo "Version directory already exists: $VERSION_DIR"
+            fi
+            
+            # Copy/update the main file
+            echo "Copying $FILE_PATH to $TARGET_FILE"
+            cp "$FILE_PATH" "$TARGET_FILE"
+            FILES_UPDATED="true"
+            
+            # If this is a solution template, also look for and copy corresponding specs file
+            if [[ "$FOLDER_TYPE" == "solution-templates" && "$FILENAME" =~ -template\.yaml$ ]]; then
+              # Look for corresponding specs.json file in the same directory
+              SOURCE_DIR=$(dirname "$FILE_PATH")
+              
+              # Look for specs file matching *-specs.json pattern
+              SPECS_FILE=$(find "$SOURCE_DIR" -maxdepth 1 -name "*-specs.json" -type f 2>/dev/null | head -1)
+              if [[ -f "$SPECS_FILE" ]]; then
+                SPECS_FILENAME=$(basename "$SPECS_FILE")
+                TARGET_SPECS_FILE="$VERSION_DIR/$SPECS_FILENAME"
+                
+                echo "Found corresponding specs file: $SPECS_FILE"
+                echo "Copying specs file: $SPECS_FILE to $TARGET_SPECS_FILE"
+                cp "$SPECS_FILE" "$TARGET_SPECS_FILE"
+                echo "✅ Successfully copied specs file: $SPECS_FILENAME"
+              fi
+            fi
+            
+            echo "✅ Successfully processed $APP_NAME/$FILENAME (version $VERSION)"
+            
+            # Write to temp files to persist variables across subshell
+            echo "$FOLDERS_CREATED" > /tmp/folders_created
+            echo "$FILES_UPDATED" > /tmp/files_updated
+            
+            # Track processed versions for this app
+            CURRENT_PROCESSED_VERSIONS=$(cat /tmp/processed_versions 2>/dev/null || echo "$PROCESSED_VERSIONS")
+            
+            UPDATED_PROCESSED_VERSIONS=$(echo "$CURRENT_PROCESSED_VERSIONS" | jq --arg app "$APP_NAME" --arg type "$FOLDER_TYPE" --arg version "$VERSION" '
+              .[$app] = (.[$app] // {"schemas": [], "solution-templates": []}) | 
+              .[$app][$type] |= (if . | index($version) then . else . + [$version] end)
+            ')
+            echo "$UPDATED_PROCESSED_VERSIONS" > /tmp/processed_versions
+          done
+          
+          # Read the final states
+          if [[ -f /tmp/folders_created ]]; then
+            FOLDERS_CREATED_FINAL=$(cat /tmp/folders_created)
+          else
+            FOLDERS_CREATED_FINAL="false"
+          fi
+          
+          if [[ -f /tmp/files_updated ]]; then
+            FILES_UPDATED_FINAL=$(cat /tmp/files_updated)
+          else
+            FILES_UPDATED_FINAL="false"
+          fi
+          
+          if [[ -f /tmp/processed_versions ]]; then
+            PROCESSED_VERSIONS_FINAL=$(cat /tmp/processed_versions)
+          else
+            PROCESSED_VERSIONS_FINAL="{}"
+          fi
+          
+          # Compact JSON to prevent formatting issues
+          PROCESSED_VERSIONS_COMPACT=$(echo "$PROCESSED_VERSIONS_FINAL" | jq -c .)
+          
+          # Validate JSON before output
+          if ! echo "$PROCESSED_VERSIONS_COMPACT" | jq empty 2>/dev/null; then
+            echo "❌ Error: Invalid JSON in processed_versions"
+            exit 1
+          fi
+          
+          # Set outputs
+          echo "folders_created=$FOLDERS_CREATED_FINAL" >> $GITHUB_OUTPUT
+          echo "files_updated=$FILES_UPDATED_FINAL" >> $GITHUB_OUTPUT
+          echo "processed_versions=$PROCESSED_VERSIONS_COMPACT" >> $GITHUB_OUTPUT
+          
+          echo "Final results:"
+          echo "  folders_created=$FOLDERS_CREATED_FINAL"
+          echo "  files_updated=$FILES_UPDATED_FINAL"
+          echo "  processed_versions=$PROCESSED_VERSIONS_COMPACT"
+
+      - name: Commit version folder changes
+        if: steps.create-folders.outputs.files_updated == 'true'
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "Auto-created version folders for solution templates and schemas"
+          file_pattern: ".pg/apps/*/workload-orchestration/solution-templates/*/* .pg/apps/*/workload-orchestration/schemas/*/*"
+
+      - name: Merge app lists and changes
+        id: merge-apps
+        run: |
+          ORIGINAL_APPS='${{ needs.detect-apps-resources-to-update.outputs.apps }}'
+          ORIGINAL_CHANGES='${{ needs.detect-apps-resources-to-update.outputs.app_changes }}'
+          PROCESSED_VERSIONS='${{ steps.create-folders.outputs.processed_versions }}'
+          
+          echo "Original apps: $ORIGINAL_APPS"
+          echo "Original changes: $ORIGINAL_CHANGES"
+          echo "Processed versions: $PROCESSED_VERSIONS"
+          
+          # Handle empty arrays gracefully
+          if [[ "$ORIGINAL_APPS" == "null" || "$ORIGINAL_APPS" == "" ]]; then
+            ORIGINAL_APPS="[]"
+          fi
+          if [[ "$ORIGINAL_CHANGES" == "null" || "$ORIGINAL_CHANGES" == "" ]]; then
+            ORIGINAL_CHANGES="{}"
+          fi
+          if [[ "$PROCESSED_VERSIONS" == "null" || "$PROCESSED_VERSIONS" == "" ]]; then
+            PROCESSED_VERSIONS="{}"
+          fi
+          
+          # Extract affected apps from processed versions keys
+          AFFECTED_APPS=$(echo "$PROCESSED_VERSIONS" | jq -c 'keys')
+          
+          # Merge the app changes structures using jq
+          MERGED_APP_CHANGES=$(echo "$ORIGINAL_CHANGES $PROCESSED_VERSIONS" | jq -s '
+            .[0] as $original | .[1] as $processed |
+            
+            # Start with original structure
+            $original |
+            
+            # For each app in processed versions, merge the arrays
+            reduce ($processed | to_entries[]) as $entry (.; 
+              .[$entry.key] = {
+                schemas: ((.[$entry.key].schemas // []) + ($entry.value.schemas // []) | unique),
+                "solution-templates": ((.[$entry.key]["solution-templates"] // []) + ($entry.value["solution-templates"] // []) | unique)
+              }
+            )
+          ')
+          
+          # Merge and deduplicate app names using derived affected apps
+          MERGED_APPS=$(echo "$ORIGINAL_APPS $AFFECTED_APPS" | jq -s 'add | unique | map(select(length > 0))')
+          
+          # Compact JSON for both outputs
+          MERGED_APPS_COMPACT=$(echo "$MERGED_APPS" | jq -c .)
+          MERGED_APP_CHANGES_COMPACT=$(echo "$MERGED_APP_CHANGES" | jq -c .)
+          
+          echo "merged_apps=$MERGED_APPS_COMPACT" >> $GITHUB_OUTPUT
+          echo "merged_app_changes=$MERGED_APP_CHANGES_COMPACT" >> $GITHUB_OUTPUT
+          
+          echo "Final merged apps: $MERGED_APPS_COMPACT"
+          echo "Final merged changes:"
+          echo "$MERGED_APP_CHANGES" | jq .
+
+  update-wo-artifacts:
+    needs: [manage-version-folders]
+    if: |
+      (needs.manage-version-folders.outputs.merged_apps != '[]' && 
+       (github.event_name != 'workflow_dispatch' || github.event.inputs.action != 'none'))
+    runs-on: ubuntu-latest
+    outputs:
+      files_created: ${{ steps.check-created.outputs.files_created }}
+    strategy:
+      fail-fast: false
+      max-parallel: 4  # Limit to 4 concurrent jobs
+      matrix:
+        app_name: ${{ fromJson(needs.manage-version-folders.outputs.merged_apps || '[]') }}
+    
+    steps:
+
+      - name: Azure Login with OIDC
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          enable-AzPSSession: true
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+          fetch-depth: 0
+
+      - name: Ensure latest changes
+        run: |
+          git fetch origin
+          git reset --hard origin/${{ github.ref_name }}
+
+      - name: Source composite actions
+        uses: ./.github/actions/wo-utilities/
+        with:
+          utilities: "yq"
+
+      - name: Read Azure config from wo-common.yaml
+        run: |
+          # Read default values from wo-common.yaml
+          DEFAULT_RG=$(yq eval '.common.rg' .pg/sites/common/wo-common.yaml)
+          DEFAULT_LOC=$(yq eval '.common.location' .pg/sites/common/wo-common.yaml)
+          
+          # Check if usesiterg override is provided
+          if [[ "${{ github.event.inputs.usesiterg }}" != "" ]]; then
+            # Use the override value
+            AZURE_RG="${{ github.event.inputs.usesiterg }}"
+            echo "Using override resource group: $AZURE_RG"
+          else
+            # Use the default from config
+            AZURE_RG="$DEFAULT_RG"
+            echo "Using default resource group from wo-common.yaml: $AZURE_RG"
+          fi
+          
+          # Location always comes from config (no override for location)
+          AZURE_LOC="$DEFAULT_LOC"
+          
+          echo "AZURE_RESOURCE_GROUP=$AZURE_RG" >> $GITHUB_ENV
+          echo "AZURE_LOCATION=$AZURE_LOC" >> $GITHUB_ENV
+          echo "Final Azure config - RG: $AZURE_RG, Location: $AZURE_LOC"
+
+      - name: Install Workload Orchestration Extension
+        uses: ./.github/actions/wo-install-wo-extension
+          
+      - name: Detect versioned files and determine actions
+        id: detect-actions
+        run: |
+          BASE_PATH=".pg/apps/${{ matrix.app_name }}/workload-orchestration"
+          CREATE_SCHEMA="false"
+          CREATE_TEMPLATE="false"
+          SCHEMA_FILES=()
+          TEMPLATE_FILES=()
+          SPEC_FILES=()
+          
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            # For manual runs, find specified versioned files for the specified actions
+            case "${{ github.event.inputs.action }}" in
+              "create-schema"|"all")
+                CREATE_SCHEMA="true"
+                # Get schema versions from input or use all versions if not specified
+                if [[ -n "${{ github.event.inputs.schema_versions }}" ]]; then
+                  IFS=',' read -ra SCHEMA_VERSIONS <<< "${{ github.event.inputs.schema_versions }}"
+                else
+                  # Find all version directories if no specific versions provided
+                  if [[ -d "$BASE_PATH/schemas" ]]; then
+                    SCHEMA_VERSIONS=()
+                    for version_dir in "$BASE_PATH/schemas"/*/ ; do
+                      if [[ -d "$version_dir" && "$(basename "$version_dir")" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                        SCHEMA_VERSIONS+=("$(basename "$version_dir")")
+                      fi
+                    done
+                  fi
+                fi
+
+                # Process each schema version
+                for version in "${SCHEMA_VERSIONS[@]}"; do
+                  version_dir="$BASE_PATH/schemas/$version"
+                  if [[ -d "$version_dir" ]]; then
+                    # Find any schema file matching *-schema.yaml pattern
+                    SCHEMA_FILE=$(find "$version_dir" -name "*-schema.yaml" -type f)
+                    if [[ -f "$SCHEMA_FILE" ]]; then
+                      SCHEMA_FILES+=("$SCHEMA_FILE")
+                    fi
+                  else
+                    echo "⚠️ Warning: Schema version directory not found: $version_dir"
+                  fi
+                done
+                ;;
+            esac
+
+            case "${{ github.event.inputs.action }}" in
+              "create-soln-template"|"all")
+                CREATE_TEMPLATE="true"
+                # Get solution template versions from input or use all versions if not specified
+                if [[ -n "${{ github.event.inputs.solution_template_versions }}" ]]; then
+                  IFS=',' read -ra TEMPLATE_VERSIONS <<< "${{ github.event.inputs.solution_template_versions }}"
+                else
+                  # Find all version directories if no specific versions provided
+                  if [[ -d "$BASE_PATH/solution-templates" ]]; then
+                    TEMPLATE_VERSIONS=()
+                    for version_dir in "$BASE_PATH/solution-templates"/*/ ; do
+                      if [[ -d "$version_dir" && "$(basename "$version_dir")" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                        TEMPLATE_VERSIONS+=("$(basename "$version_dir")")
+                      fi
+                    done
+                  fi
+                fi
+
+                # Process each template version
+                for version in "${TEMPLATE_VERSIONS[@]}"; do
+                  version_dir="$BASE_PATH/solution-templates/$version"
+                  if [[ -d "$version_dir" ]]; then
+                    # Find any solution template file matching *-template.yaml pattern
+                    TEMPLATE_FILE=$(find "$version_dir" -name "*-template.yaml" -type f)
+                    
+                    # Find any specs file matching *-specs.json pattern
+                    SPEC_FILE=$(find "$version_dir" -name "*-specs.json" -type f)
+                    
+                    # Only add if both files exist
+                    if [[ -f "$TEMPLATE_FILE" && -f "$SPEC_FILE" ]]; then
+                      TEMPLATE_FILES+=("$TEMPLATE_FILE")
+                      SPEC_FILES+=("$SPEC_FILE")
+                    elif [[ -f "$TEMPLATE_FILE" ]]; then
+                      echo "⚠️ Warning: Template file found but no spec file: $TEMPLATE_FILE"
+                    fi
+                  else
+                    echo "⚠️ Warning: Template version directory not found: $version_dir"
+                  fi
+                done
+                ;;
+            esac
+          else
+            # For push events, check changed files and determine actions based on versioned files only
+            # Use merged app changes from manage-version-folders
+            APP_CHANGES='${{ needs.manage-version-folders.outputs.merged_app_changes }}'
+            
+            # Check if this app has changes
+            APP_DATA=$(echo "$APP_CHANGES" | jq --arg app "${{ matrix.app_name }}" '.[$app] // empty')
+            if [[ -n "$APP_DATA" ]]; then
+              # Check for versioned schema changes
+              SCHEMA_VERSIONS=$(echo "$APP_DATA" | jq -r '.schemas[]?' || true)
+              
+              if [[ -n "$SCHEMA_VERSIONS" ]]; then
+                CREATE_SCHEMA="true"
+                
+                # Add versioned schema files
+                for version in $SCHEMA_VERSIONS; do
+                  version_dir="$BASE_PATH/schemas/$version"
+                  # Find any schema file matching *-schema.yaml pattern
+                  SCHEMA_FILE=$(find "$version_dir" -name "*-schema.yaml" -type f)
+                  if [[ -f "$SCHEMA_FILE" ]]; then
+                    SCHEMA_FILES+=("$SCHEMA_FILE")
+                  fi
+                done
+              fi
+              
+              # Check for versioned solution template changes
+              TEMPLATE_VERSIONS=$(echo "$APP_DATA" | jq -r '."solution-templates"[]?' || true)
+              
+              if [[ -n "$TEMPLATE_VERSIONS" ]]; then
+                CREATE_TEMPLATE="true"
+                
+                # Add versioned solution template files and their spec files
+                for version in $TEMPLATE_VERSIONS; do
+                  version_dir="$BASE_PATH/solution-templates/$version"
+                  # Find any solution template file matching *-template.yaml pattern
+                  TEMPLATE_FILE=$(find "$version_dir" -name "*-template.yaml" -type f)
+                  
+                  # Find any specs file matching *-specs.json pattern
+                  SPEC_FILE=$(find "$version_dir" -name "*-specs.json" -type f)
+                  
+                  # Only add if both files exist
+                  if [[ -f "$TEMPLATE_FILE" && -f "$SPEC_FILE" ]]; then
+                    TEMPLATE_FILES+=("$TEMPLATE_FILE")
+                    SPEC_FILES+=("$SPEC_FILE")
+                  elif [[ -f "$TEMPLATE_FILE" ]]; then
+                    echo "⚠️ Warning: Template file found but no spec file: $TEMPLATE_FILE"
+                  fi
+                done
+              fi
+            fi
+          fi
+          
+          # Convert arrays to JSON
+          SCHEMA_FILES_JSON=$(printf '%s\n' "${SCHEMA_FILES[@]}" | jq -R -s -c 'split("\n") | map(select(length > 0))')
+          TEMPLATE_FILES_JSON=$(printf '%s\n' "${TEMPLATE_FILES[@]}" | jq -R -s -c 'split("\n") | map(select(length > 0))')
+          SPEC_FILES_JSON=$(printf '%s\n' "${SPEC_FILES[@]}" | jq -R -s -c 'split("\n") | map(select(length > 0))')
+          
+          # Set outputs
+          echo "create_schema=$CREATE_SCHEMA" >> $GITHUB_OUTPUT
+          echo "create_template=$CREATE_TEMPLATE" >> $GITHUB_OUTPUT
+          echo "schema_files=$SCHEMA_FILES_JSON" >> $GITHUB_OUTPUT
+          echo "template_files=$TEMPLATE_FILES_JSON" >> $GITHUB_OUTPUT
+          echo "spec_files=$SPEC_FILES_JSON" >> $GITHUB_OUTPUT
+          
+          echo "Actions for ${{ matrix.app_name }}: schema=$CREATE_SCHEMA, template=$CREATE_TEMPLATE"
+          echo "Schema files: $SCHEMA_FILES_JSON"
+          echo "Template files: $TEMPLATE_FILES_JSON"
+          echo "Spec files: $SPEC_FILES_JSON"
+
+      - name: Create App Schemas (Versioned Only)
+        id: create-schemas
+        if: steps.detect-actions.outputs.create_schema == 'true'
+        uses: ./.github/actions/wo-create-schema
+        with:
+          app-name: ${{ matrix.app_name }}
+          resource-group: ${{ env.AZURE_RESOURCE_GROUP }}
+          location: ${{ env.AZURE_LOCATION }}
+          schema-files: ${{ steps.detect-actions.outputs.schema_files }}
+
+      - name: Store Schema Results
+        id: store-schema-results
+        if: steps.detect-actions.outputs.create_schema == 'true'
+        run: |
+          # Store schema validation results as artifacts for aggregation
+          mkdir -p schema-results
+          
+          # Create a result file for this matrix job
+          RESULT_FILE="schema-results/${{ matrix.app_name }}-results.json"
+          
+          cat > "$RESULT_FILE" << EOF
+          {
+            "app_name": "${{ matrix.app_name }}",
+            "schemas_skipped": "${{ steps.create-schemas.outputs.schemas-skipped || '0' }}",
+            "schemas_failed": "${{ steps.create-schemas.outputs.schemas-failed || '0' }}",
+            "skipped_schemas_details": ${{ steps.create-schemas.outputs.skipped-schemas-details || '[]' }},
+            "failed_schemas_details": ${{ steps.create-schemas.outputs.failed-schemas-details || '[]' }}
+          }
+          EOF
+          
+          echo "Schema results for ${{ matrix.app_name }}:"
+          cat "$RESULT_FILE"
+
+      - name: Upload Schema Results
+        if: steps.detect-actions.outputs.create_schema == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: schema-results-${{ matrix.app_name }}
+          path: schema-results/
+          retention-days: 1
+
+      - name: Create App Solution Templates (Versioned Only)
+        id: create-templates
+        if: steps.detect-actions.outputs.create_template == 'true'
+        uses: ./.github/actions/wo-create-solution-template
+        with:
+          app-name: ${{ matrix.app_name }}
+          resource-group: ${{ env.AZURE_RESOURCE_GROUP }}
+          location: ${{ env.AZURE_LOCATION }}
+          template-files: ${{ steps.detect-actions.outputs.template_files }}
+          specification-files: ${{ steps.detect-actions.outputs.spec_files }}
+          metadata-file: .pg/apps/${{ matrix.app_name }}/workload-orchestration/metadata.yaml
+
+      - name: Store Template Results
+        id: store-template-results
+        if: steps.detect-actions.outputs.create_template == 'true'
+        run: |
+          # Store solution template validation results as artifacts for aggregation
+          mkdir -p template-results
+          
+          # Create a result file for this matrix job
+          RESULT_FILE="template-results/${{ matrix.app_name }}-results.json"
+          
+          cat > "$RESULT_FILE" << EOF
+          {
+            "app_name": "${{ matrix.app_name }}",
+            "templates_skipped": "${{ steps.create-templates.outputs.templates-skipped || '0' }}",
+            "templates_failed": "${{ steps.create-templates.outputs.templates-failed || '0' }}",
+            "skipped_templates_details": ${{ steps.create-templates.outputs.skipped-templates-details || '[]' }},
+            "failed_templates_details": ${{ steps.create-templates.outputs.failed-templates-details || '[]' }}
+          }
+          EOF
+          
+          echo "Template results for ${{ matrix.app_name }}:"
+          cat "$RESULT_FILE"
+
+      - name: Upload Template Results
+        if: steps.detect-actions.outputs.create_template == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: template-results-${{ matrix.app_name }}
+          path: template-results/
+          retention-days: 1
+
+      - name: Check if files were created
+        id: check-created
+        run: |
+          # Check if any files were created (either schema or template)
+          if [[ "${{ steps.create-templates.outputs.files_created }}" == "true" ]] || [[ "${{ steps.detect-actions.outputs.create_schema }}" == "true" ]]; then
+            echo "files_created=true" >> $GITHUB_OUTPUT
+          else
+            echo "files_created=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Upload generated files
+        if: steps.check-created.outputs.files_created == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: generated-artifacts-${{ matrix.app_name }}
+          path: .pg/apps/${{ matrix.app_name }}/solutions/
+          retention-days: 1
+          if-no-files-found: warn
+
+  update_common_artifacts:
+    needs: update-context
+    if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.update_common != 'none' }}
+    runs-on: ubuntu-latest
+    outputs:
+      files_created: ${{ steps.check-created.outputs.files_created }}
+    steps:
+      - name: Azure Login with OIDC
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          enable-AzPSSession: true
+
+      - uses: actions/checkout@v4
+
+      - name: Source composite actions
+        uses: ./.github/actions/wo-utilities/
+        with:
+          utilities: "yq"
+
+      - name: Read Azure config from wo-common.yaml
+        run: |
+          # Read default values from wo-common.yaml
+          DEFAULT_RG=$(yq eval '.common.rg' .pg/sites/common/wo-common.yaml)
+          DEFAULT_LOC=$(yq eval '.common.location' .pg/sites/common/wo-common.yaml)
+          
+          # Check if usesiterg override is provided
+          if [[ "${{ github.event.inputs.usesiterg }}" != "" ]]; then
+            # Use the override value
+            AZURE_RG="${{ github.event.inputs.usesiterg }}"
+            echo "Using override resource group: $AZURE_RG"
+          else
+            # Use the default from config
+            AZURE_RG="$DEFAULT_RG"
+            echo "Using default resource group from wo-common.yaml: $AZURE_RG"
+          fi
+          
+          # Location always comes from config (no override for location)
+          AZURE_LOC="$DEFAULT_LOC"
+          
+          echo "AZURE_RESOURCE_GROUP=$AZURE_RG" >> $GITHUB_ENV
+          echo "AZURE_LOCATION=$AZURE_LOC" >> $GITHUB_ENV
+          echo "Final Azure config - RG: $AZURE_RG, Location: $AZURE_LOC"
+
+      - name: Install Workload Orchestration Extension
+        uses: ./.github/actions/wo-install-wo-extension
+
+      - name: Get files
+        id: get-files
+        run: |
+          # Initialize arrays for schema and config template files
+          SCHEMA_FILES=()
+          CONFIG_FILES=()
+
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "Manual dispatch - processing specified versions only"
+            
+            # Process schema versions from input or find all if not specified
+            if [[ -n "${{ github.event.inputs.schema_versions }}" ]]; then
+              echo "Using specified schema versions: ${{ github.event.inputs.schema_versions }}"
+              IFS=',' read -ra SCHEMA_VERSIONS <<< "${{ github.event.inputs.schema_versions }}"
+            else
+              echo "No schema versions specified, finding all available versions"
+              SCHEMA_VERSIONS=()
+              for schema_dir in .pg/apps/common/schemas/*/; do
+                if [[ -d "$schema_dir" && "$(basename "$schema_dir")" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                  SCHEMA_VERSIONS+=("$(basename "$schema_dir")")
+                fi
+              done
+            fi
+
+            # Process each specified schema version
+            for version in "${SCHEMA_VERSIONS[@]}"; do
+              version=$(echo "$version" | xargs)  # Trim whitespace
+              schema_dir=".pg/apps/common/schemas/$version"
+              if [[ -d "$schema_dir" ]]; then
+                # Find any schema file matching *-schema.yaml pattern
+                SCHEMA_FILE=$(find "$schema_dir" -name "*-schema.yaml" -type f)
+                if [[ -f "$SCHEMA_FILE" ]]; then
+                  SCHEMA_FILES+=("$SCHEMA_FILE")
+                  echo "Found schema file: $SCHEMA_FILE"
+                fi
+              else
+                echo "⚠️ Warning: Schema version directory not found: $schema_dir"
+              fi
+            done
+
+            # Process config template versions from input or find all if not specified
+            if [[ -n "${{ github.event.inputs.solution_template_versions }}" ]]; then
+              echo "Using specified config template versions: ${{ github.event.inputs.solution_template_versions }}"
+              IFS=',' read -ra CONFIG_VERSIONS <<< "${{ github.event.inputs.solution_template_versions }}"
+            else
+              echo "No config template versions specified, finding all available versions"
+              CONFIG_VERSIONS=()
+              for config_dir in .pg/apps/common/config-templates/*/; do
+                if [[ -d "$config_dir" && "$(basename "$config_dir")" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                  CONFIG_VERSIONS+=("$(basename "$config_dir")")
+                fi
+              done
+            fi
+
+            # Process each specified config template version
+            for version in "${CONFIG_VERSIONS[@]}"; do
+              version=$(echo "$version" | xargs)  # Trim whitespace
+              config_dir=".pg/apps/common/config-templates/$version"
+              if [[ -d "$config_dir" ]]; then
+                # Check for both naming patterns
+                if [[ -f "$config_dir/common-config-template.yaml" ]]; then
+                  CONFIG_FILES+=("$config_dir/common-config-template.yaml")
+                  echo "Found config template file: $config_dir/common-config-template.yaml"
+                elif [[ -f "$config_dir/config-template.yaml" ]]; then
+                  CONFIG_FILES+=("$config_dir/config-template.yaml")
+                  echo "Found config template file: $config_dir/config-template.yaml"
+                fi
+              else
+                echo "⚠️ Warning: Config template version directory not found: $config_dir"
+              fi
+            done
+          else
+            echo "Push/workflow_run event - processing only changed files"
+            
+            # Get changed files from the previous step
+            CHANGED_FILES="${{ steps.changed-files.outputs.all_changed_files }}"
+            echo "Changed files: $CHANGED_FILES"
+            
+            # Process each changed file and extract only the ones that match our patterns
+            while IFS= read -r file; do
+              # Check for versioned schema files
+              if [[ "$file" =~ ^\.pg/apps/common/schemas/([0-9]+\.[0-9]+\.[0-9]+)/(.*\.yaml)$ ]]; then
+                version="${BASH_REMATCH[1]}"
+                filename="${BASH_REMATCH[2]}"
+                echo "Found changed schema file: $file (version: $version, filename: $filename)"
+                
+                # Verify the file exists and add it
+                if [[ -f "$file" ]]; then
+                  SCHEMA_FILES+=("$file")
+                  echo "Added schema file: $file"
+                else
+                  echo "⚠️ Warning: Changed schema file not found: $file"
+                fi
+              # Check for versioned config template files
+              elif [[ "$file" =~ ^\.pg/apps/common/config-templates/([0-9]+\.[0-9]+\.[0-9]+)/(.*\.yaml)$ ]]; then
+                version="${BASH_REMATCH[1]}"
+                filename="${BASH_REMATCH[2]}"
+                echo "Found changed config template file: $file (version: $version, filename: $filename)"
+                
+                # Verify the file exists and add it
+                if [[ -f "$file" ]]; then
+                  CONFIG_FILES+=("$file")
+                  echo "Added config template file: $file"
+                else
+                  echo "⚠️ Warning: Changed config template file not found: $file"
+                fi
+              fi
+            done <<< "$(echo "$CHANGED_FILES" | tr ' ' '\n')"
+            
+            # Log what we found
+            echo "Changed schema files found: ${#SCHEMA_FILES[@]}"
+            echo "Changed config template files found: ${#CONFIG_FILES[@]}"
+            
+            if [[ ${#SCHEMA_FILES[@]} -eq 0 && ${#CONFIG_FILES[@]} -eq 0 ]]; then
+              echo "No versioned common files changed - nothing to process"
+            fi
+          fi
+
+          # Convert arrays to JSON, filtering out empty strings
+          SCHEMA_FILES_JSON=$(printf '%s\n' "${SCHEMA_FILES[@]}" | jq -R -s -c 'split("\n") | map(select(length > 0))')
+          CONFIG_FILES_JSON=$(printf '%s\n' "${CONFIG_FILES[@]}" | jq -R -s -c 'split("\n") | map(select(length > 0))')
+
+          # Set outputs
+          echo "schema_files=$SCHEMA_FILES_JSON" >> $GITHUB_OUTPUT
+          echo "config_files=$CONFIG_FILES_JSON" >> $GITHUB_OUTPUT
+
+          # Log findings
+          echo "Found schema files: $SCHEMA_FILES_JSON"
+          echo "Found config template files: $CONFIG_FILES_JSON"
+        
+      - name: Check changed files
+        if: github.event_name == 'push' || github.event_name == 'workflow_run'
+        id: changed-files
+        uses: ./.github/actions/wo-changed-files
+        with:
+          files: .pg/apps/common/*
+
+      - name: Set update flags
+        id: update-flags
+        run: |
+          # Initialize flags
+          UPDATE_COMMON_SCHEMA="false"
+          UPDATE_COMMON_CONFIG="false"
+
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            # For manual runs, check update_common input
+            case "${{ github.event.inputs.update_common }}" in
+              "schema-only"|"all")
+                UPDATE_COMMON_SCHEMA="true"
+                ;;
+            esac
+            case "${{ github.event.inputs.update_common }}" in
+              "config-only"|"all")
+                UPDATE_COMMON_CONFIG="true"
+                ;;
+            esac
+          else
+            # For push events, check changed files in versioned directories
+            CHANGED_FILES="${{ steps.changed-files.outputs.all_changed_files }}"
+
+            # Check for schema changes in any version directory
+            if echo "$CHANGED_FILES" | grep -q ".pg/apps/common/schemas/[0-9]\+\.[0-9]\+\.[0-9]\+/.*\.yaml"; then
+              UPDATE_COMMON_SCHEMA="true"
+            fi
+
+            # Check for config template changes in any version directory
+            if echo "$CHANGED_FILES" | grep -q ".pg/apps/common/config-templates/[0-9]\+\.[0-9]\+\.[0-9]\+/.*\.yaml"; then
+              UPDATE_COMMON_CONFIG="true"
+            fi
+          fi
+
+          # Set outputs
+          echo "update_schema=$UPDATE_COMMON_SCHEMA" >> $GITHUB_OUTPUT
+          echo "update_config=$UPDATE_COMMON_CONFIG" >> $GITHUB_OUTPUT
+
+          # Echo final status using local variables
+          echo "Set flags: schema=$UPDATE_COMMON_SCHEMA, template=$UPDATE_COMMON_CONFIG"
+
+      - name: Create Common Schema
+        id: create-common-schemas
+        if: steps.update-flags.outputs.update_schema == 'true'
+        uses: ./.github/actions/wo-create-schema
+        with:
+          app-name: common
+          resource-group: ${{ env.AZURE_RESOURCE_GROUP }}
+          location: ${{ env.AZURE_LOCATION }}
+          schema-files: ${{ steps.get-files.outputs.schema_files }}
+
+      - name: Store Common Schema Results
+        id: store-common-schema-results
+        if: steps.update-flags.outputs.update_schema == 'true'
+        run: |
+          # Store schema validation results as artifacts for aggregation
+          mkdir -p schema-results
+          
+          # Create a result file for common schemas
+          RESULT_FILE="schema-results/common-results.json"
+          
+          cat > "$RESULT_FILE" << EOF
+          {
+            "app_name": "common",
+            "schemas_skipped": "${{ steps.create-common-schemas.outputs.schemas-skipped || '0' }}",
+            "schemas_failed": "${{ steps.create-common-schemas.outputs.schemas-failed || '0' }}",
+            "skipped_schemas_details": ${{ steps.create-common-schemas.outputs.skipped-schemas-details || '[]' }},
+            "failed_schemas_details": ${{ steps.create-common-schemas.outputs.failed-schemas-details || '[]' }}
+          }
+          EOF
+          
+          echo "Common schema results:"
+          cat "$RESULT_FILE"
+
+      - name: Upload Common Schema Results
+        if: steps.update-flags.outputs.update_schema == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: schema-results-common
+          path: schema-results/
+          retention-days: 1
+
+      - name: Create Common Config Template
+        id: create-config
+        if: steps.update-flags.outputs.update_config == 'true'
+        uses: ./.github/actions/wo-create-config-template
+        with:
+          resource-group: ${{ env.AZURE_RESOURCE_GROUP }}
+          config-template-files: ${{ steps.get-files.outputs.config_files }}
+          description: "Common configuration template for shared settings"
+          location: ${{ env.AZURE_LOCATION }}
+
+      - name: Store Config Template Results
+        id: store-config-results
+        if: steps.update-flags.outputs.update_config == 'true'
+        run: |
+          # Store config template validation results as artifacts for aggregation
+          mkdir -p config-template-results
+          
+          # Create a result file
+          RESULT_FILE="config-template-results/common-results.json"
+          
+          cat > "$RESULT_FILE" << EOF
+          {
+            "app_name": "common",
+            "templates_skipped": "${{ steps.create-config.outputs.templates-skipped || '0' }}",
+            "templates_failed": "${{ steps.create-config.outputs.templates-failed || '0' }}",
+            "skipped_templates_details": ${{ steps.create-config.outputs.skipped-templates-details || '[]' }},
+            "failed_templates_details": ${{ steps.create-config.outputs.failed-templates-details || '[]' }}
+          }
+          EOF
+          
+          echo "Config template results:"
+          cat "$RESULT_FILE"
+
+      - name: Upload Config Template Results
+        if: steps.update-flags.outputs.update_config == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: config-template-results-common
+          path: config-template-results/
+          retention-days: 1
+
+      - name: Check if files were created
+        id: check-created
+        run: |
+          # Check if any files were created (either schema or config)
+          if [[ "${{ steps.create-config.outputs.files_created }}" == "true" ]] || [[ "${{ steps.update-flags.outputs.update_schema }}" == "true" ]]; then
+            echo "files_created=true" >> $GITHUB_OUTPUT
+          else
+            echo "files_created=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Upload generated files
+        if: steps.check-created.outputs.files_created == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: generated-artifacts-common
+          path: .pg/apps/common/solutions/
+          retention-days: 1
+          if-no-files-found: warn
+
+  commit-solution-files:
+    needs: [update-wo-artifacts, update_common_artifacts]
+    if: always() && (needs.update-wo-artifacts.outputs.files_created == 'true' || needs.update_common_artifacts.outputs.files_created == 'true')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+          fetch-depth: 0
+
+      - name: Ensure latest changes
+        run: |
+          git fetch origin
+          git reset --hard origin/${{ github.ref_name }}
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: generated-artifacts-*
+          path: downloaded-artifacts
+
+      - name: Process and copy artifacts to correct locations
+        run: |
+          echo "Processing downloaded artifacts..."
+          
+          # Create solutions directories if they don't exist
+          mkdir -p .pg/apps/common/solutions
+          
+          # Process each artifact
+          for artifact_dir in downloaded-artifacts/generated-artifacts-*; do
+            if [ -d "$artifact_dir" ]; then
+              artifact_name=$(basename "$artifact_dir")
+              echo "Processing $artifact_name"
+              
+              if [[ "$artifact_name" == "generated-artifacts-common" ]]; then
+                # Copy common solutions
+                if [ -d "$artifact_dir" ]; then
+                  cp -r "$artifact_dir"/* .pg/apps/common/solutions/ 2>/dev/null || echo "No files to copy for common"
+                fi
+              else
+                # Extract app name from artifact name
+                app_name=${artifact_name#generated-artifacts-}
+                echo "Processing app: $app_name"
+                
+                # Create app solutions directory
+                mkdir -p ".pg/apps/$app_name/solutions"
+                
+                # Copy app solutions
+                if [ -d "$artifact_dir" ]; then
+                  cp -r "$artifact_dir"/* ".pg/apps/$app_name/solutions/" 2>/dev/null || echo "No files to copy for $app_name"
+                fi
+              fi
+            fi
+          done
+
+      - name: Commit all generated files
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "Generated workload orchestration artifacts (v2 - versioned only)"
+          file_pattern: ".pg/**"
+
+  report-schema-validation-errors:
+    needs: [update-wo-artifacts, commit-solution-files]
+    if: always() && needs.update-wo-artifacts.result != 'skipped'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download app schema results
+        uses: actions/download-artifact@v4
+        with:
+          pattern: schema-results-*
+          path: schema-results
+          merge-multiple: true
+        continue-on-error: true
+
+      - name: Process and report app schema validation results
+        run: |
+          TOTAL_SKIPPED=0
+          TOTAL_FAILED=0
+          ALL_SKIPPED_DETAILS="[]"
+          ALL_FAILED_DETAILS="[]"
+          
+          echo "Processing app schema results..."
+          
+          # Check if schema-results directory exists and has files
+          if [[ -d "schema-results" && $(ls -A schema-results/ 2>/dev/null) ]]; then
+            # Process each result file (excluding common)
+            for result_file in schema-results/*-results.json; do
+              if [[ -f "$result_file" && ! "$result_file" =~ common-results\.json$ ]]; then
+                echo "Processing: $result_file"
+                
+                SKIPPED=$(jq -r '.schemas_skipped // "0"' "$result_file")
+                FAILED=$(jq -r '.schemas_failed // "0"' "$result_file")
+                SKIPPED_DETAILS=$(jq -c '.skipped_schemas_details // []' "$result_file")
+                FAILED_DETAILS=$(jq -c '.failed_schemas_details // []' "$result_file")
+                
+                echo "  Skipped: $SKIPPED, Failed: $FAILED"
+                
+                # Add to totals
+                TOTAL_SKIPPED=$((TOTAL_SKIPPED + SKIPPED))
+                TOTAL_FAILED=$((TOTAL_FAILED + FAILED))
+                
+                # Merge details
+                if [[ "$SKIPPED_DETAILS" != "[]" ]]; then
+                  ALL_SKIPPED_DETAILS=$(echo "$ALL_SKIPPED_DETAILS" | jq --argjson new "$SKIPPED_DETAILS" '. + $new')
+                fi
+                
+                if [[ "$FAILED_DETAILS" != "[]" ]]; then
+                  ALL_FAILED_DETAILS=$(echo "$ALL_FAILED_DETAILS" | jq --argjson new "$FAILED_DETAILS" '. + $new')
+                fi
+              fi
+            done
+          else
+            echo "No app schema results found - no app schema validation was performed"
+            exit 0
+          fi
+          
+          echo ""
+          echo "📊 Aggregated App Schema Results:"
+          echo "   Total app schemas skipped: $TOTAL_SKIPPED"
+          echo "   Total app schemas failed: $TOTAL_FAILED"
+          
+          # Only report and fail if there are actually issues
+          if [[ $TOTAL_SKIPPED -gt 0 || $TOTAL_FAILED -gt 0 ]]; then
+            echo ""
+            echo "🚨 App Schema Validation Issues Found:"
+            echo ""
+            
+            if [[ "$TOTAL_SKIPPED" -gt 0 ]]; then
+              echo "⏭️  Skipped App Schemas (Version Conflicts): $TOTAL_SKIPPED"
+              echo "The following app schema versions were skipped because they already exist:"
+              echo "$ALL_SKIPPED_DETAILS" | jq -r '.[] | "   - \(.["schema-name"]) v\(.version) (\(.file))"'
+              echo ""
+            fi
+            
+            if [[ "$TOTAL_FAILED" -gt 0 ]]; then
+              echo "❌ Failed App Schema Creations: $TOTAL_FAILED"
+              echo "The following app schema creations failed:"
+              echo "$ALL_FAILED_DETAILS" | jq -r '.[] | "   - \(.["schema-name"]) v\(.version): \(.error) (\(.file))"'
+              echo ""
+              echo "🔍 Detailed Error Information:"
+              echo "$ALL_FAILED_DETAILS" | jq -r '.[] | "   File: \(.file)\n   Schema: \(.["schema-name"]) v\(.version)\n   Error: \(.error)\n   Details: \(.["error-details"])\n"'
+            fi
+            
+            echo "📝 Summary:"
+            echo "   Total app schemas skipped: $TOTAL_SKIPPED"
+            echo "   Total app schemas failed: $TOTAL_FAILED"
+            echo ""
+            
+            if [[ "$TOTAL_SKIPPED" -gt 0 ]]; then
+              echo "⚠️  Skipped app schemas indicate version conflicts. Please create new versions for any changes to existing versioned files."
+            fi
+            
+            if [[ "$TOTAL_FAILED" -gt 0 ]]; then
+              echo "❌ Failed app schema creations require attention. Please review the errors above and fix the underlying issues."
+              exit 1
+            fi
+            
+            if [[ "$TOTAL_SKIPPED" -gt 0 ]]; then
+              echo "⚠️  The workflow completed successfully but some app schemas were skipped due to version conflicts."
+              exit 1
+            fi
+          else
+            echo "✅ All app schema validations passed successfully"
+          fi
+
+  report-common-schema-validation-errors:
+    needs: [update_common_artifacts, commit-solution-files]
+    if: always() && needs.update_common_artifacts.result != 'skipped'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download common schema results
+        uses: actions/download-artifact@v4
+        with:
+          name: schema-results-common
+          path: schema-results
+        continue-on-error: true
+
+      - name: Process and report common schema validation results
+        run: |
+          TOTAL_SKIPPED=0
+          TOTAL_FAILED=0
+          ALL_SKIPPED_DETAILS="[]"
+          ALL_FAILED_DETAILS="[]"
+          
+          echo "Processing common schema results..."
+          
+          # Check if common schema results exist
+          if [[ -f "schema-results/common-results.json" ]]; then
+            echo "Processing: schema-results/common-results.json"
+            
+            SKIPPED=$(jq -r '.schemas_skipped // "0"' "schema-results/common-results.json")
+            FAILED=$(jq -r '.schemas_failed // "0"' "schema-results/common-results.json")
+            SKIPPED_DETAILS=$(jq -c '.skipped_schemas_details // []' "schema-results/common-results.json")
+            FAILED_DETAILS=$(jq -c '.failed_schemas_details // []' "schema-results/common-results.json")
+            
+            echo "  Skipped: $SKIPPED, Failed: $FAILED"
+            
+            # Set totals
+            TOTAL_SKIPPED=$SKIPPED
+            TOTAL_FAILED=$FAILED
+            ALL_SKIPPED_DETAILS=$SKIPPED_DETAILS
+            ALL_FAILED_DETAILS=$FAILED_DETAILS
+          else
+            echo "No common schema results found - no common schema validation was performed"
+            exit 0
+          fi
+          
+          echo ""
+          echo "📊 Common Schema Results:"
+          echo "   Total common schemas skipped: $TOTAL_SKIPPED"
+          echo "   Total common schemas failed: $TOTAL_FAILED"
+          
+          # Only report and fail if there are actually issues
+          if [[ $TOTAL_SKIPPED -gt 0 || $TOTAL_FAILED -gt 0 ]]; then
+            echo ""
+            echo "🚨 Common Schema Validation Issues Found:"
+            echo ""
+            
+            if [[ "$TOTAL_SKIPPED" -gt 0 ]]; then
+              echo "⏭️  Skipped Common Schemas (Version Conflicts): $TOTAL_SKIPPED"
+              echo "The following common schema versions were skipped because they already exist:"
+              echo "$ALL_SKIPPED_DETAILS" | jq -r '.[] | "   - \(.["schema-name"]) v\(.version) (\(.file))"'
+              echo ""
+            fi
+            
+            if [[ "$TOTAL_FAILED" -gt 0 ]]; then
+              echo "❌ Failed Common Schema Creations: $TOTAL_FAILED"
+              echo "The following common schema creations failed:"
+              echo "$ALL_FAILED_DETAILS" | jq -r '.[] | "   - \(.["schema-name"]) v\(.version): \(.error) (\(.file))"'
+              echo ""
+              echo "🔍 Detailed Error Information:"
+              echo "$ALL_FAILED_DETAILS" | jq -r '.[] | "   File: \(.file)\n   Schema: \(.["schema-name"]) v\(.version)\n   Error: \(.error)\n   Details: \(.["error-details"])\n"'
+            fi
+            
+            echo "📝 Summary:"
+            echo "   Total common schemas skipped: $TOTAL_SKIPPED"
+            echo "   Total common schemas failed: $TOTAL_FAILED"
+            echo ""
+            
+            if [[ "$TOTAL_SKIPPED" -gt 0 ]]; then
+              echo "⚠️  Skipped common schemas indicate version conflicts. Please create new versions for any changes to existing versioned files."
+            fi
+            
+            if [[ "$TOTAL_FAILED" -gt 0 ]]; then
+              echo "❌ Failed common schema creations require attention. Please review the errors above and fix the underlying issues."
+              exit 1
+            fi
+            
+            if [[ "$TOTAL_SKIPPED" -gt 0 ]]; then
+              echo "⚠️  The workflow completed successfully but some common schemas were skipped due to version conflicts."
+              exit 1
+            fi
+          else
+            echo "✅ All common schema validations passed successfully"
+          fi
+
+
+  report-config-template-validation-errors:
+    needs: [update_common_artifacts, commit-solution-files]
+    if: always() && needs.update_common_artifacts.result != 'skipped'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download config template results
+        uses: actions/download-artifact@v4
+        with:
+          pattern: config-template-results-*
+          path: config-template-results
+          merge-multiple: true
+        continue-on-error: true
+
+      - name: Process and report config template validation results
+        run: |
+          TOTAL_SKIPPED=0
+          TOTAL_FAILED=0
+          ALL_SKIPPED_DETAILS="[]"
+          ALL_FAILED_DETAILS="[]"
+          
+          echo "Processing config template results..."
+          
+          # Check if config-template-results directory exists and has files
+          if [[ -d "config-template-results" && $(ls -A config-template-results/ 2>/dev/null) ]]; then
+            # Process each result file
+            for result_file in config-template-results/*-results.json; do
+              if [[ -f "$result_file" ]]; then
+                echo "Processing: $result_file"
+                
+                SKIPPED=$(jq -r '.templates_skipped // "0"' "$result_file")
+                FAILED=$(jq -r '.templates_failed // "0"' "$result_file")
+                SKIPPED_DETAILS=$(jq -c '.skipped_templates_details // []' "$result_file")
+                FAILED_DETAILS=$(jq -c '.failed_templates_details // []' "$result_file")
+                
+                echo "  Skipped: $SKIPPED, Failed: $FAILED"
+                
+                # Add to totals
+                TOTAL_SKIPPED=$((TOTAL_SKIPPED + SKIPPED))
+                TOTAL_FAILED=$((TOTAL_FAILED + FAILED))
+                
+                # Merge details
+                if [[ "$SKIPPED_DETAILS" != "[]" ]]; then
+                  ALL_SKIPPED_DETAILS=$(echo "$ALL_SKIPPED_DETAILS" | jq --argjson new "$SKIPPED_DETAILS" '. + $new')
+                fi
+                
+                if [[ "$FAILED_DETAILS" != "[]" ]]; then
+                  ALL_FAILED_DETAILS=$(echo "$ALL_FAILED_DETAILS" | jq --argjson new "$FAILED_DETAILS" '. + $new')
+                fi
+              fi
+            done
+          else
+            echo "No config template results found - no validation was performed"
+            exit 0
+          fi
+          
+          echo ""
+          echo "📊 Aggregated Results:"
+          echo "   Total config templates skipped: $TOTAL_SKIPPED"
+          echo "   Total config templates failed: $TOTAL_FAILED"
+          
+          # Only report and fail if there are actually issues
+          if [[ $TOTAL_SKIPPED -gt 0 || $TOTAL_FAILED -gt 0 ]]; then
+            echo ""
+            echo "🚨 Config Template Validation Issues Found:"
+            echo ""
+            
+            if [[ "$TOTAL_SKIPPED" -gt 0 ]]; then
+              echo "⏭️  Skipped Config Templates (Version Conflicts): $TOTAL_SKIPPED"
+              echo "The following config template versions were skipped because they already exist:"
+              echo "$ALL_SKIPPED_DETAILS" | jq -r '.[] | "   - \(.["template-name"]) v\(.version) (\(.file))"'
+              echo ""
+            fi
+            
+            if [[ "$TOTAL_FAILED" -gt 0 ]]; then
+              echo "❌ Failed Config Template Creations: $TOTAL_FAILED"
+              echo "The following config template creations failed:"
+              echo "$ALL_FAILED_DETAILS" | jq -r '.[] | "   - \(.["template-name"]) v\(.version): \(.error) (\(.file))"'
+              echo ""
+              echo "🔍 Detailed Error Information:"
+              echo "$ALL_FAILED_DETAILS" | jq -r '.[] | "   File: \(.file)\n   Template: \(.["template-name"]) v\(.version)\n   Error: \(.error)\n   Details: \(.["error-details"])\n"'
+            fi
+            
+            echo "📝 Summary:"
+            echo "   Total config templates skipped: $TOTAL_SKIPPED"
+            echo "   Total config templates failed: $TOTAL_FAILED"
+            echo ""
+            
+            if [[ "$TOTAL_SKIPPED" -gt 0 ]]; then
+              echo "⚠️  Skipped config templates indicate version conflicts. Please create new versions for any changes to existing versioned files."
+            fi
+            
+            if [[ "$TOTAL_FAILED" -gt 0 ]]; then
+              echo "❌ Failed config template creations require attention. Please review the errors above and fix the underlying issues."
+              exit 1
+            fi
+            
+            if [[ "$TOTAL_SKIPPED" -gt 0 ]]; then
+              echo "⚠️  The workflow completed successfully but some config templates were skipped due to version conflicts."
+              exit 1
+            fi
+          else
+            echo "✅ All config template validations passed successfully"
+          fi
+
+      - name: Report Config Template Results (Legacy)
+        if: false  # Disabled in favor of inline reporting above
+        uses: ./.github/actions/wo-config-template-report
+        with:
+          templates-skipped: ${{ env.TOTAL_SKIPPED }}
+          templates-failed: ${{ env.TOTAL_FAILED }}
+          skipped-templates-details: ${{ env.ALL_SKIPPED_DETAILS }}
+          failed-templates-details: ${{ env.ALL_FAILED_DETAILS }}
+
+  report-template-validation-errors:
+    needs: [update-wo-artifacts, commit-solution-files]
+    if: always() && needs.update-wo-artifacts.result != 'skipped'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download template results
+        uses: actions/download-artifact@v4
+        with:
+          pattern: template-results-*
+          path: template-results
+          merge-multiple: true
+        continue-on-error: true
+
+      - name: Process and report template validation results
+        run: |
+          TOTAL_SKIPPED=0
+          TOTAL_FAILED=0
+          ALL_SKIPPED_DETAILS="[]"
+          ALL_FAILED_DETAILS="[]"
+          
+          echo "Processing template results..."
+          
+          # Check if template-results directory exists and has files
+          if [[ -d "template-results" && $(ls -A template-results/ 2>/dev/null) ]]; then
+            # Process each result file
+            for result_file in template-results/*-results.json; do
+              if [[ -f "$result_file" ]]; then
+                echo "Processing: $result_file"
+                
+                SKIPPED=$(jq -r '.templates_skipped // "0"' "$result_file")
+                FAILED=$(jq -r '.templates_failed // "0"' "$result_file")
+                SKIPPED_DETAILS=$(jq -c '.skipped_templates_details // []' "$result_file")
+                FAILED_DETAILS=$(jq -c '.failed_templates_details // []' "$result_file")
+                
+                echo "  Skipped: $SKIPPED, Failed: $FAILED"
+                
+                # Add to totals
+                TOTAL_SKIPPED=$((TOTAL_SKIPPED + SKIPPED))
+                TOTAL_FAILED=$((TOTAL_FAILED + FAILED))
+                
+                # Merge details
+                if [[ "$SKIPPED_DETAILS" != "[]" ]]; then
+                  ALL_SKIPPED_DETAILS=$(echo "$ALL_SKIPPED_DETAILS" | jq --argjson new "$SKIPPED_DETAILS" '. + $new')
+                fi
+                
+                if [[ "$FAILED_DETAILS" != "[]" ]]; then
+                  ALL_FAILED_DETAILS=$(echo "$ALL_FAILED_DETAILS" | jq --argjson new "$FAILED_DETAILS" '. + $new')
+                fi
+              fi
+            done
+          else
+            echo "No template results found - no template validation was performed"
+            exit 0
+          fi
+          
+          echo ""
+          echo "📊 Aggregated Results:"
+          echo "   Total templates skipped: $TOTAL_SKIPPED"
+          echo "   Total templates failed: $TOTAL_FAILED"
+          
+          echo "TOTAL_SKIPPED=$TOTAL_SKIPPED" >> $GITHUB_ENV
+          echo "TOTAL_FAILED=$TOTAL_FAILED" >> $GITHUB_ENV
+          echo "ALL_SKIPPED_DETAILS=$ALL_SKIPPED_DETAILS" >> $GITHUB_ENV
+          echo "ALL_FAILED_DETAILS=$ALL_FAILED_DETAILS" >> $GITHUB_ENV

@@ -1,0 +1,290 @@
+#------------------------------------------------------------------------
+#
+# The workflow helps with creating an arc connected cluster as necessary
+# and setting it up for workload orchestration operational readiness
+# 
+# ---- No Arc-connected Cluster   ---> Create AKS cluster, Arc-connect
+# ----   Arc-connected Cluster    ---> Validate cluster
+#
+# workflow action: 
+#
+#      wo-setuponly-aks-conn-cls  ---> Create new AKS cluster, make it WO ready
+#      wo-setuponly-arc-conn-cls  ---> Update existing ARC_CONN, make it WO ready
+#      wo-all-in-one-arc-conn-cls ---> WO ready + svgrps + targets
+#
+#------------------------------------------------------------------------
+
+name: WO-INFRA-DEPLOY
+run-name: "Site: ${{ github.event.inputs.sites }} :: ${{ github.event.inputs.action }} => ${{ github.event.inputs.commands }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        type: choice
+        description:  choose an action
+        default: none
+        options:
+        - none
+        - (** AzArc connected **) wo-setup-woready-arc-cls
+        - (** new AKS **) wo-setup-woready-aks-cls
+        - (** new AKS **) wo-setup-woready-allinone-aks-cls
+        - wo-setup-contexts
+        - wo-setup-svgrps
+        - wo-setup-targets
+        - wo-delete-targets
+        - wo-delete-svgrps
+        - wo-delete-aks-conn-cls
+        required: true
+      sites:
+        type: choice
+        description: choose location
+        default: none
+        options:
+        - none
+        - albany 
+        - bethel
+        - canton
+        - denver
+        - eugene
+        - frisco
+        - graham
+        - houston
+        - tanzu
+        required: true
+      commands:
+        type: string
+        description: optional additional directions
+        default: "no action"
+        required: true
+      usesiterg:
+        type: string
+        description: TESTING RG OVERRIDE
+        default: false
+
+permissions:
+  id-token: write # for actions
+  contents: write # for actions/checkout
+
+jobs:
+
+  input-validation:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: input parameters
+      run: |
+        echo "This run is with the following parms:"
+        echo "action:    ${{ github.event.inputs.action }}"
+        echo "sites:     ${{ github.event.inputs.sites }}"
+        echo "commands:  ${{ github.event.inputs.commands }}"
+        echo "usesiterg: ${{ github.event.inputs.usesiterg }}"
+        echo
+
+    - name: validate site inputs
+      if: ${{ github.event.inputs.action != 'none' && github.event.inputs.sites == 'none' }}
+      run: |
+        echo " *** INPUT ERROR *** Missing site."
+        echo " --> Please re-run worklow with correct inputs"
+        exit 1
+
+    - name: validate action inputs
+      if: ${{ github.event.inputs.action == 'none' && github.event.inputs.sites != 'none' && github.event.inputs.commands == 'no action' }}
+      run: |
+        echo " *** INPUT ERROR *** Missing action."
+        echo " --> Please re-run worklow with correct inputs"
+        exit 1
+
+  call-wo-setuponly-arc-conn-cls:
+    if: ${{ github.event.inputs.action == '(** AzArc connected **) wo-setup-woready-arc-cls' && github.event.inputs.sites != 'none' }}
+    uses: ./.github/workflows/wo-setup-woready-arc-conn-cls-reusable.yml
+    with:
+      site: ${{ github.event.inputs.sites }}
+      rg: ${{ github.event.inputs.usesiterg }}
+    secrets:
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+      AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+  call-wo-setuponly-aks-conn-cls:
+    if: ${{ github.event.inputs.action == '(** new AKS **) wo-setup-woready-aks-cls' && github.event.inputs.sites != 'none' }}
+    uses: ./.github/workflows/wo-setup-woready-aks-conn-cls-reusable.yml
+    with:
+      site: ${{ github.event.inputs.sites }}
+      rg: ${{ github.event.inputs.usesiterg }}
+    secrets:
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+      AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+  call-wo-all-in-one-aks-conn-cls:
+     if: ${{ github.event.inputs.action == '(** new AKS **) wo-setup-woready-allinone-aks-cls' && github.event.inputs.sites != 'none' }}
+     uses: ./.github/workflows/wo-all-in-one-aks-woready-cls-reusable.yml
+     with:
+       site: ${{ github.event.inputs.sites }}
+       rg: ${{ github.event.inputs.usesiterg }}
+     secrets:
+       AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+       AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+       AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+  call-wo-setup-contexts:
+     if: ${{ github.event.inputs.action == 'wo-setup-contexts' && github.event.inputs.sites != 'none' }}
+     uses: ./.github/workflows/wo-setup-contexts-reusable.yml
+     with:
+       site: ${{ github.event.inputs.sites }}
+       rg: ${{ github.event.inputs.usesiterg }}
+     secrets:
+       AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+       AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+       AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+  call-wo-setup-sites:
+     if: ${{ github.event.inputs.action == 'wo-setup-sites' && github.event.inputs.sites != 'none' }}
+     uses: ./.github/workflows/wo-setup-sites-reusable.yml
+     with:
+       site: ${{ github.event.inputs.sites }}
+       rg: ${{ github.event.inputs.usesiterg }}
+     secrets:
+       AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+       AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+       AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+  call-wo-setup-svgrps:
+     if: ${{ github.event.inputs.action == 'wo-setup-svgrps' && github.event.inputs.sites != 'none' }}
+     uses: ./.github/workflows/wo-setup-svgrps-reusable.yml
+     with:
+       site: ${{ github.event.inputs.sites }}
+       rg: ${{ github.event.inputs.usesiterg }}
+     secrets:
+       AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+       AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+       AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+  call-wo-setup-targets:
+     if: ${{ github.event.inputs.action == 'wo-setup-targets' && github.event.inputs.sites != 'none' }}
+     uses: ./.github/workflows/wo-setup-targets-reusable.yml
+     with:
+       site: ${{ github.event.inputs.sites }}
+       rg: ${{ github.event.inputs.usesiterg }}
+     secrets:
+       AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+       AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+       AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+  call-wo-delete-targets:
+     if: ${{ github.event.inputs.action == 'wo-delete-targets' && github.event.inputs.sites != 'none' }}
+     uses: ./.github/workflows/wo-delete-targets-reusable.yml
+     with:
+       site: ${{ github.event.inputs.sites }}
+       rg: ${{ github.event.inputs.usesiterg }}
+     secrets:
+       AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+       AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+       AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+  call-wo-delete-svgrps:
+     if: ${{ github.event.inputs.action == 'wo-delete-svgrps' && github.event.inputs.sites != 'none' }}
+     uses: ./.github/workflows/wo-delete-svgrps-reusable.yml
+     with:
+       site: ${{ github.event.inputs.sites }}
+       rg: ${{ github.event.inputs.usesiterg }}
+     secrets:
+       AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+       AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+       AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+  call-wo-delete-aks-conn-cluster:
+    if: ${{ github.event.inputs.action == 'wo-delete-aks-conn-cls' && github.event.inputs.sites != 'none' }}
+    env:
+      rg:  ${{ github.event.inputs.usesiterg }}
+      site:  ${{ github.event.inputs.sites }}
+      action:  ${{ github.event.inputs.action }}
+      cmdsinput:  ${{ github.event.inputs.commands }}
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Azure setup
+      id: azsetup
+      uses: ./.github/actions/wo-azure-setup
+      with:
+        client-id: ${{ secrets.AZURE_CLIENT_ID }}
+        tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+        subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+        azcliversion: "2.73.0"
+
+    - name: Install prereq extensions
+      id: wo-prereqs
+      uses: ./.github/actions/wo-prereqs
+
+    - name: Delete aks connected cluster
+      id: wo-delete-aks-conn-cluster
+      uses: ./.github/actions/wo-delete-aks-conn-cluster
+      with: 
+       site: ${{ github.event.inputs.sites }}
+       rg: ${{ github.event.inputs.usesiterg }}
+
+
+  call-wo-sanity-check:
+     if: ${{ github.event.inputs.commands == 'sanity' && github.event.inputs.sites != 'none' }}
+     uses: ./.github/workflows/wo-sanity-reusable.yml
+     with:
+       site: ${{ github.event.inputs.sites }}
+       rg: ${{ github.event.inputs.usesiterg }}
+     secrets:
+       AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+       AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+       AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+  action-none:
+    if: ${{ github.event.inputs.action == 'none' && github.event.inputs.sites == 'none' }}
+    env:
+      rg:  ${{ github.event.inputs.usesiterg }}
+      site:  ${{ github.event.inputs.sites }}
+      action:  ${{ github.event.inputs.action }}
+      cmdsinput:  ${{ github.event.inputs.commands }}
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Azure setup
+      id: azsetup
+      uses: ./.github/actions/wo-azure-setup
+      with:
+        client-id: ${{ secrets.AZURE_CLIENT_ID }}
+        tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+        subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+        azcliversion: "2.73.0"
+
+    - name: Install prereq extensions
+      id: wo-prereqs
+      uses: ./.github/actions/wo-prereqs
+
+    - name: Source site info
+      id: getsiteinfo
+      if: ${{ github.event.inputs.sites != 'none' }}
+      uses: ./.github/actions/wo-get-site-info
+      with:
+        site: ${{ github.event.inputs.sites }}
+        rg: ${{ github.event.inputs.usesiterg }}
+
+    - name: Show runner hardware info
+      shell: bash
+      run: |
+        echo "Runner OS: $RUNNER_OS"
+        echo "Runner Architecture: $RUNNER_ARCH"
+        echo "Runner Name: $RUNNER_NAME"
+        uname -a
+        lscpu || true
+        cat /proc/cpuinfo || true
+        free -h || true
+
+    - name: Execute command line
+      run: |
+        echo "command: ${{ env.cmdsinput }}"
+        ${{ env.cmdsinput }}

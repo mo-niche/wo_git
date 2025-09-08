@@ -1,0 +1,13 @@
+solution-templates:
+  - solutionTemplateName: "testapp1-solution"
+    baseconfig: "defaultbaseconfig.json"
+    versions:
+      - version: 0.3.0
+        instanceName: "testapp1-inst-030"
+        sites:
+          - siteName: "houston"
+            targets:
+              - targetName: "hou-li-1"
+                override:
+                  ErrorThreshold: 0301
+                  TemperatureRangeMax: "03011"

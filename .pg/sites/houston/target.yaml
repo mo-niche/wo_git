@@ -1,0 +1,11 @@
+target:
+  houston:
+    - name: "hou-li-1"
+      level: "line"
+      caps:
+        - azure-soap
+        - azure-shampoo
+      scope: "houston"
+      spec: "targetspecs.json"
+      # system updated
+      targetId: ""

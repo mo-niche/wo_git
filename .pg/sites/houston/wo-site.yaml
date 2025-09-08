@@ -1,0 +1,9 @@
+site:
+  siteRG:                       "wf-rg-houston"
+  aksLocation: 			"eastus"
+  aksClusterName: 		"wf-houston-cls"
+  aksClusterIdentity: 		"wf-houston-clsId"
+  customLocationRG: 		"wf-rg-houston"
+  customLocationName: 		"wf-houston-custlocation"
+  customLocationLocation:       "eastus"
+  customLocationNamespace: 	"wf-houston-ns"

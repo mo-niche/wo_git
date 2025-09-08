@@ -1,0 +1,55 @@
+# Resusable workflow to setup sites for a given cluster if wo-ready
+
+name: wo-setup-sites (Reusable)
+
+on:
+  workflow_call:
+    inputs:
+      site:
+        required: true
+        type: string
+      rg:
+        required: true
+        type: string
+    secrets:
+      AZURE_CLIENT_ID:
+        required: true
+      AZURE_TENANT_ID:
+        required: true
+      AZURE_SUBSCRIPTION_ID:
+        required: true
+
+jobs:
+
+  wo-setup-sites-cls:
+    env:
+      site: ${{ inputs.site }}
+      rg: ${{ inputs.rg }}
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Azure setup
+      id: azsetup
+      uses: ./.github/actions/wo-azure-setup
+      with:
+        client-id: ${{ secrets.AZURE_CLIENT_ID }}
+        tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+        subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+        azcliversion: "2.73.0"
+
+    - name: Check for WO readiness
+      id: check-wo-ready
+      uses: ./.github/actions/wo-check-woready-cluster
+      with:
+        site: ${{ inputs.site }}
+        rg: ${{ inputs.rg }}
+
+    - name: Create sites
+      if: ${{ steps.check-wo-ready.outputs.woready == 'true' }}
+      uses: ./.github/actions/wo-setup-sites
+      with:
+        site: ${{ inputs.site }}
+        rg: ${{ inputs.rg }}
