@@ -24,7 +24,7 @@ capabilities:
     description: "Shampoo"
 
 sites:
-  siteList: "albany,bethel,canton,denver,eugene,frisco,graham,houston,tanzu"
+  siteList: "albany,bethel,canton,denver,eugene,frisco,graham,houston,tanzu,mnath3-site"
  
 hierarchy:
   levels: "country,region,factory,line"
