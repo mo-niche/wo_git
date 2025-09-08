@@ -1,0 +1,9 @@
+site:
+  siteRG:                       "mnath3-rg"
+  aksLocation: 			"eastus2"
+  aksClusterName: 		"mnath3-aks"
+  aksClusterIdentity: 		"mnath3-aks"
+  customLocationRG: 		"mnath3-rg"
+  customLocationName: 		"mnath3-aks-Location"
+  customLocationLocation:       "eastus2"
+  customLocationNamespace: 	"default"

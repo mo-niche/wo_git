@@ -1,0 +1,11 @@
+target:
+  mnath3-site:
+    - name: "mnath3-li-1"
+      level: "line"
+      caps:
+        - azure-soap
+        - azure-shampoo
+      scope: "mnath3-site"
+      spec: "targetspecs.json"
+      # system updated
+      targetId: ""
